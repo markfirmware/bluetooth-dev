@@ -1,0 +1,14 @@
+[pi0]
+kernel=bluetooth-dev-bluetoothtest-kernel-RPI.img
+
+[pi1]
+kernel=bluetooth-dev-bluetoothtest-kernel-RPI.img
+
+[pi2]
+kernel=bluetooth-dev-bluetoothtest-kernel-RPI2.img
+
+[pi3]
+kernel=bluetooth-dev-bluetoothtest-kernel-RPI3.img
+
+[all]
+cmdline=bluetooth-dev-bluetoothtest-cmdline.txt
