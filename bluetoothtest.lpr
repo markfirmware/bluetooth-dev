@@ -1,12 +1,6 @@
 program BluetoothTest;
 {$mode objfpc}{$H+}
 
-//{$define BUILD_RPI}
-//{$define BUILD_RPI2}
-//{$define BUILD_RPI3}
-// default is RPI3:
-{$ifndef BUILD_RPI} {$ifndef BUILD_RPI2} {$ifndef BUILD_RPI3} {$define CONF_RPI3} {$endif} {$endif} {$endif}
-
 uses 
 {$ifdef BUILD_RPI } BCM2708,BCM2835, {$endif}
 {$ifdef BUILD_RPI2} BCM2709,BCM2836, {$endif}
@@ -15,6 +9,10 @@ GlobalConfig,GlobalConst,GlobalTypes,Platform,Threads,SysUtils,Classes,Console,L
 Serial,DWCOTG,FileSystem,MMC,FATFS,Keyboard;
 
 const 
+ ScanUnitsPerSecond          = 1600;
+ ScanInterval                = 5.000;
+ ScanWindow                  = 0.500;
+
  HCI_COMMAND_PKT             = $01;
  HCI_EVENT_PKT               = $04;
  OGF_MARKER                  = $00;
@@ -59,6 +57,9 @@ type
 var 
  BluetoothUartDeviceDescription:String;
  BluetoothMiniDriverFileName:String;
+ CommandMode,UpdatingBeacon,BeaconMode:Boolean;
+ Margin,StartTime:LongWord;
+ Idle:Boolean;
  AdData : array of byte;
  FWHandle:integer;
  HciSequenceNumber:Integer = 0;
@@ -67,6 +68,13 @@ var
  UART0:PSerialDevice = Nil;
  KeyboardLoopHandle:TThreadHandle = INVALID_HANDLE_VALUE;
  HTTPListener:THTTPListener;
+ ReadByteCounter:Integer = 0;
+ Scheme:Array[0..3] of String = ('http://www.','https://www.','http://','https://');
+ Expansion:Array[0..13] of String = ('.com/','.org/','.edu/','.net/','.info/','.biz','.gov/','.com','.org','.edu','.net','.info','.biz','.gov');
+
+function ReadByte:Byte; forward;
+procedure StopAdvertising; forward;
+procedure StartUndirectedAdvertising; forward;
 
 procedure Log(s:string);
 begin
@@ -174,32 +182,222 @@ begin
   Sleep(1*1000);
 end;
 
-var 
- ByteCounter:Integer = 0;
+procedure ClearAdvertisingData;
+begin
+ SetLength(AdData,0);
+end;
 
-function Readbyte:Byte;
+procedure AddAdvertisingData (Type_ : byte; Data : array of byte); overload;
+var 
+ Len : byte;
+ i : integer;
+begin
+ Len:=Length (AdData);
+ SetLength (AdData, Len + length (Data) + 2);
+ AdData[Len]:=Length (Data) + 1;
+ AdData[Len + 1]:=Type_;
+ for i:=0 to high (Data) do
+  AdData[Len + 2 + i]:=Data[i];
+end;
+
+procedure AddAdvertisingData (Type_ : byte; Data : string); overload;
+var 
+ Len : byte;
+ i : integer;
+begin
+ Len:=Length (AdData);
+ SetLength (AdData, Len + length (Data) + 2);
+ AdData[Len]:=Length (Data) + 1;
+ AdData[Len + 1]:=Type_;
+ for i:=1 to length (Data) do
+  AdData[Len + 1 + i]:=ord (Data[i]);
+end;
+
+procedure AddAdvertisingData(Type_:byte); overload;
+begin
+ AddAdvertisingData (Type_, []);
+end;
+
+procedure AddHCICommand(OpCode:Word; Params:array of byte);
+var 
+ i:integer;
+ Cmd:array of byte;
+ res,count:LongWord;
+ PacketType,EventCode,PacketLength,CanAcceptPackets,Status:Byte;
+begin
+ Inc(HciSequenceNumber);
+ // if OpCode <> $fc4c then
+ //  Log(Format('hci %d op %04.4x',[HciSequenceNumber,OpCode]));
+ SetLength(Cmd,length(Params) + 4);
+ Cmd[0]:=HCI_COMMAND_PKT;
+ Cmd[1]:=lo(OpCode);          // little endian so lowest sent first
+ Cmd[2]:=hi(OpCode);
+ Cmd[3]:=length(Params);
+ for i:=0 to length(Params) - 1 do
+  Cmd[4 + i]:=Params[i];
+ count:=0;
+ res:=SerialDeviceWrite(UART0,@Cmd[0],length(Cmd),SERIAL_WRITE_NONE,count);
+ if res = ERROR_SUCCESS then
+  begin
+   PacketType:=ReadByte;
+   if PacketType <> HCI_EVENT_PKT then
+    Fail(Format('event type not hci event: %d',[PacketType]));
+   EventCode:=ReadByte;
+   if EventCode <> $0E then
+    Fail(Format('event code not command completed: %02.2x',[EventCode]));
+   PacketLength:=ReadByte;
+   if PacketLength <> 4 then
+    Fail(Format('packet length not 4: %d',[PacketLength]));
+   CanAcceptPackets:=ReadByte;
+   if CanAcceptPackets <> 1 then
+    Fail(Format('can accept packets not 1: %d',[CanAcceptPackets]));
+   ReadByte; // completed command low
+   ReadByte; // completed command high
+   Status:=ReadByte;
+   if Status <> 0 then
+    Fail(Format('status not 0: %d',[Status]));
+  end
+ else
+  Log('Error writing to BT.');
+end;
+
+procedure AddHCICommand(OGF:byte; OCF:Word; Params:array of byte);
+begin
+ AddHCICommand((OGF shl 10) or OCF,Params);
+end;
+
+procedure SetLEAdvertisingData(Data:array of byte);
+var 
+ Params:array of byte;
+ Len:byte;
+ i:integer;
+begin
+ Len:=Min(Length(Data),31);
+ SetLength(Params,Len + 1);
+ Params[0]:=Len;
+ for i:=0 to Len - 1 do
+  Params[i + 1]:=Data[i];
+ AddHCICommand(OGF_LE_CONTROL,$08,Params);
+end;
+
+procedure UpdateBeacon;
+var 
+ EddystoneServiceData:Array of Byte;
+ I:Integer;
+ UpTime:LongWord;
+const 
+ Part1 = 'ultibo';
+procedure AddByte(X:Byte);
+begin
+ SetLength(EddystoneServiceData,Length(EddystoneServiceData) + 1);
+ EddystoneServiceData[Length(EddystoneServiceData) - 1]:=X;
+end;
+procedure AddWord(X:Word);
+begin
+ AddByte(Hi(X));
+ AddByte(Lo(X));
+end;
+procedure AddLongWord(X:LongWord);
+begin
+ AddWord(Hi(X));
+ AddWord(Lo(X));
+end;
+begin
+ SetLength(EddystoneServiceData,0);
+ AddByte(Lo(EddystoneUuid));
+ AddByte(Hi(EddystoneUuid));
+ if BeaconMode then
+  begin
+   AddByte($10);
+   AddByte($00);
+   AddByte($03);
+   for I:=1 to Length(Part1) do
+    AddByte(Ord(Part1[I]));
+   AddByte($08);
+  end
+ else
+  begin
+   UpTime:=ClockGetCount div (100*1000);
+   AddByte($20);
+   AddByte($00);
+   AddWord(4993);
+   AddWord(TemperatureGetCurrent(0));
+   AddWord(UpTime div 100);
+   AddLongWord(UpTime);
+  end;
+ ClearAdvertisingData;
+ AddAdvertisingData(ADT_FLAGS,[$18]);
+ AddAdvertisingData(ADT_COMPLETE_UUID16,[Lo(EddystoneUuid),Hi(EddystoneUuid)]);
+ AddAdvertisingData(ADT_SERVICE_DATA,EddystoneServiceData);
+ SetLEAdvertisingData(AdData);
+end;
+
+procedure SetLEAdvertisingParameters(MinInterval,MaxInterval:Word; Type_:byte; OwnAddressType,PeerAddressType:byte; PeerAddr:TBDAddr; ChannelMap,FilterPolicy:byte);
+begin
+ AddHCICommand(OGF_LE_CONTROL,$06,[lo(MinInterval),hi(MinInterval),
+ lo(MaxInterval),hi(MaxInterval),
+ Type_,OwnAddressType,PeerAddressType,
+ PeerAddr[0],PeerAddr[1],PeerAddr[2],
+ PeerAddr[3],PeerAddr[4],PeerAddr[5],
+ ChannelMap,FilterPolicy]);
+end;
+
+procedure StartLeAdvertising;
+var 
+ ZeroAddress:TBDAddr = ($00,$00,$00,$00,$00,$00);
+begin
+ SetLEAdvertisingParameters(1000,1000,ADV_IND,$00,$00,ZeroAddress,$07,$00);
+ UpdateBeacon;
+ StartUndirectedAdvertising;
+ CommandMode:=False;
+end;
+
+function ReadByte:Byte;
 var 
  c:LongWord;
  b:Byte;
  res:Integer;
- timestamp:LongWord;
+ Now:LongWord;
+ EntryTime:LongWord;
 begin
  Result:=0;
- timestamp:=ClockGetCount;
- while ClockGetCount - timestamp < 10*1000*1000 do
+ EntryTime:=ClockGetCount;
+ while ClockGetCount - EntryTime < 10*1000*1000 do
   begin
+   Now:=ClockGetCount;
    c:=0;
    res:=SerialDeviceRead(UART0,@b,1,SERIAL_READ_NON_BLOCK,c);
    if (res = ERROR_SUCCESS) and (c = 1) then
     begin
      Result:=b;
-     Inc(ByteCounter);
-     //   if (ByteCounter mod 1000) = 0 then
-     //    Log(Format('%6d bytes read',[ByteCounter]));
-     Exit;
+     Inc(ReadByteCounter);
+     if (not CommandMode) and Idle then
+      begin
+       Idle:=False;
+       StartTime:=Now;
+       if (Margin <> 0) and (Now - EntryTime < Margin) then
+        begin
+         Margin:=Now - EntryTime;
+         Log(Format('Lowest scanning margin is now %5.2f seconds',[Margin / (1*1000*1000)]));
+        end;
+      end;
+     exit;
     end
    else
-    ThreadYield;
+    begin
+     if (not CommandMode) and (not Idle) and (((Now - StartTime)/(1*1000*1000))  > (ScanWindow + 0.100))  then
+      begin
+       Idle:=True;
+       if UpdatingBeacon then
+        begin
+         CommandMode:=True;
+         StopAdvertising;
+         BeaconMode:=not BeaconMode;
+         StartLeAdvertising;
+        end;
+      end;
+     ThreadYield;
+    end;
   end;
  Fail('timeout waiting for serial read byte');
 end;
@@ -260,54 +458,6 @@ begin
 
    Sleep(50);
   end;
-end;
-
-procedure AddHCICommand(OpCode:Word; Params:array of byte);
-var 
- i:integer;
- Cmd:array of byte;
- res,count:LongWord;
- PacketType,EventCode,PacketLength,CanAcceptPackets,Status:Byte;
-begin
- Inc(HciSequenceNumber);
- // if OpCode <> $fc4c then
- //  Log(Format('hci %d op %04.4x',[HciSequenceNumber,OpCode]));
- SetLength(Cmd,length(Params) + 4);
- Cmd[0]:=HCI_COMMAND_PKT;
- Cmd[1]:=lo(OpCode);          // little endian so lowest sent first
- Cmd[2]:=hi(OpCode);
- Cmd[3]:=length(Params);
- for i:=0 to length(Params) - 1 do
-  Cmd[4 + i]:=Params[i];
- count:=0;
- res:=SerialDeviceWrite(UART0,@Cmd[0],length(Cmd),SERIAL_WRITE_NONE,count);
- if res = ERROR_SUCCESS then
-  begin
-   PacketType:=ReadByte;
-   if PacketType <> HCI_EVENT_PKT then
-    Fail(Format('event type not hci event: %d',[PacketType]));
-   EventCode:=ReadByte;
-   if EventCode <> $0E then
-    Fail(Format('event code not command completed: %02.2x',[EventCode]));
-   PacketLength:=ReadByte;
-   if PacketLength <> 4 then
-    Fail(Format('packet length not 4: %d',[PacketLength]));
-   CanAcceptPackets:=ReadByte;
-   if CanAcceptPackets <> 1 then
-    Fail(Format('can accept packets not 1: %d',[CanAcceptPackets]));
-   ReadByte; // completed command low
-   ReadByte; // completed command high
-   Status:=ReadByte;
-   if Status <> 0 then
-    Fail(Format('status not 0: %d',[Status]));
-  end
- else
-  Log('Error writing to BT.');
-end;
-
-procedure AddHCICommand(OGF:byte; OCF:Word; Params:array of byte);
-begin
- AddHCICommand((OGF shl 10) or OCF,Params);
 end;
 
 procedure ResetChip;
@@ -391,10 +541,8 @@ begin
 end;
 
 procedure StartPassiveScanning;
-const 
- UnitsPerSecond = 1600;
 begin
- SetLEScanParameters(LL_SCAN_PASSIVE,5*UnitsPerSecond,Round(0.5*UnitsPerSecond),$00,$00);
+ SetLEScanParameters(LL_SCAN_PASSIVE,Round(ScanInterval*ScanUnitsPerSecond),Round(ScanWindow*ScanUnitsPerSecond),$00,$00);
  SetLEScanEnable(True,False);
 end;
 
@@ -472,103 +620,6 @@ begin
  SetLEAdvertisingEnable(false);
 end;
 
-procedure ClearAdvertisingData;
-begin
- SetLength(AdData,0);
-end;
-
-procedure AddAdvertisingData (Type_ : byte; Data : array of byte); overload;
-var 
- Len : byte;
- i : integer;
-begin
- Len:=Length (AdData);
- SetLength (AdData, Len + length (Data) + 2);
- AdData[Len]:=Length (Data) + 1;
- AdData[Len + 1]:=Type_;
- for i:=0 to high (Data) do
-  AdData[Len + 2 + i]:=Data[i];
-end;
-
-procedure AddAdvertisingData (Type_ : byte; Data : string); overload;
-var 
- Len : byte;
- i : integer;
-begin
- Len:=Length (AdData);
- SetLength (AdData, Len + length (Data) + 2);
- AdData[Len]:=Length (Data) + 1;
- AdData[Len + 1]:=Type_;
- for i:=1 to length (Data) do
-  AdData[Len + 1 + i]:=ord (Data[i]);
-end;
-
-procedure AddAdvertisingData(Type_:byte); overload;
-begin
- AddAdvertisingData (Type_, []);
-end;
-
-procedure SetLEAdvertisingData(Data:array of byte);
-var 
- Params:array of byte;
- Len:byte;
- i:integer;
-begin
- Len:=Min(Length(Data),31);
- SetLength(Params,Len + 1);
- Params[0]:=Len;
- for i:=0 to Len - 1 do
-  Params[i + 1]:=Data[i];
- AddHCICommand(OGF_LE_CONTROL,$08,Params);
-end;
-
-procedure UpdateBeacon;
-var 
- EddystoneServiceData:Array of Byte;
- I:Integer;
-const 
- Part1 = 'ultibo';
-procedure AddByte(X:Byte);
-begin
- SetLength(EddystoneServiceData,Length(EddystoneServiceData) + 1);
- EddystoneServiceData[Length(EddystoneServiceData) - 1]:=X;
-end;
-begin
- SetLength(EddystoneServiceData,0);
- AddByte(Lo(EddystoneUuid));
- AddByte(Hi(EddystoneUuid));
- AddByte($10);
- AddByte($00);
- AddByte($03);
- for I:=1 to Length(Part1) do
-  AddByte(Ord(Part1[I]));
- AddByte($08);
- ClearAdvertisingData;
- AddAdvertisingData(ADT_FLAGS,[$18]);
- AddAdvertisingData(ADT_COMPLETE_UUID16,[Lo(EddystoneUuid),Hi(EddystoneUuid)]);
- AddAdvertisingData(ADT_SERVICE_DATA,EddystoneServiceData);
- SetLEAdvertisingData(AdData);
-end;
-
-procedure SetLEAdvertisingParameters(MinInterval,MaxInterval:Word; Type_:byte; OwnAddressType,PeerAddressType:byte; PeerAddr:TBDAddr; ChannelMap,FilterPolicy:byte);
-begin
- AddHCICommand(OGF_LE_CONTROL,$06,[lo(MinInterval),hi(MinInterval),
- lo(MaxInterval),hi(MaxInterval),
- Type_,OwnAddressType,PeerAddressType,
- PeerAddr[0],PeerAddr[1],PeerAddr[2],
- PeerAddr[3],PeerAddr[4],PeerAddr[5],
- ChannelMap,FilterPolicy]);
-end;
-
-procedure StartLeAdvertising;
-var 
- ZeroAddress:TBDAddr = ($00,$00,$00,$00,$00,$00);
-begin
- SetLEAdvertisingParameters(1000,1000,ADV_IND,$00,$00,ZeroAddress,$07,$00);
- UpdateBeacon;
- StartUndirectedAdvertising;
-end;
-
 function dBm(Rssi:Byte):String;
 var 
  si:String;
@@ -580,15 +631,16 @@ begin
  Result:=si;
 end;
 
-var 
- Scheme:Array[0..3] of String = ('http://www.','https://www.','http://','https://');
- Expansion:Array[0..13] of String = ('.com/','.org/','.edu/','.net/','.info/','.biz','.gov/','.com','.org','.edu','.net','.info','.biz','.gov');
-
 procedure ParseEvent;
 var 
  I:Integer;
  EventType,EventSubtype,EventLength:Byte;
  EddystoneLength,AdType,EddystoneLo,EddystoneHi,EddystoneType,TransmitPower,Rssi,C:Byte;
+ TlmVersion:Byte;
+ TlmBattery:Word;
+ TlmTemperature:Word;
+ TlmAdvCount:LongWord;
+ TlmSecCount:LongWord;
  Event:Array of Byte;
  S:String;
  GetByteIndex:Integer;
@@ -596,6 +648,16 @@ function GetByte:Byte;
 begin
  Result:=Event[GetByteIndex];
  Inc(GetByteIndex);
+end;
+function GetWord:Word;
+begin
+ Result:=GetByte;
+ Result:=GetByte or (Result shl 8);
+end;
+function GetLongWord:LongWord;
+begin
+ Result:=GetWord;
+ Result:=GetWord or (Result shl 16);
 end;
 begin
  EventType:=ReadByte;
@@ -609,7 +671,7 @@ begin
    Event[I - 1]:=ReadByte;
    S:=S+Event[I - 1].ToHexString(2) + ' ';
   end;
- if EventLength = 31 then
+ if (EventLength = 31) or (EventLength = 37) then
   begin
    GetByteIndex:=18;
    EddystoneLength:=GetByte;
@@ -617,21 +679,34 @@ begin
    EddystoneLo:=GetByte;
    EddystoneHi:=GetByte;
    EddystoneType:=GetByte;
-   TransmitPower:=GetByte;
-   if (AdType = ADT_SERVICE_DATA) and (((EddystoneHi shl 8) or EddystoneLo) = EddystoneUuid) and (EddystoneType = $10) then
+   if (AdType = ADT_SERVICE_DATA) and (((EddystoneHi shl 8) or EddystoneLo) = EddystoneUuid) then
     begin
-     C:=GetByte;
-     S:=Scheme[C];
-     while GetByteIndex <= High(Event) - 1 do
+     if EddystoneType = $10 then
       begin
+       TransmitPower:=GetByte;
        C:=GetByte;
-       if C <= High(Expansion) then
-        S:=S + Expansion[C]
-       else
-        S:=S + Char(C);
-      end;
-     Rssi:=GetByte;
-     Log(Format('eddystone url %s tx power %s rssi %s',[S,dBm(TransmitPower),dBm(Rssi)]));
+       S:=Scheme[C];
+       while GetByteIndex <= High(Event) - 1 do
+        begin
+         C:=GetByte;
+         if C <= High(Expansion) then
+          S:=S + Expansion[C]
+         else
+          S:=S + Char(C);
+        end;
+       Rssi:=GetByte;
+       Log(Format('eddystone url %s tx power %s rssi %s',[S,dBm(TransmitPower),dBm(Rssi)]));
+      end
+     else if EddystoneType = $20 then
+           begin
+            TlmVersion:=GetByte;
+            TlmBattery:=GetWord;
+            TlmTemperature:=GetWord;
+            TlmAdvCount:=GetLongWord;
+            TlmSecCount:=GetLongWord;
+            Rssi:=GetByte;
+            Log(Format('eddystone unencrypted tlm ver %02.2x Battery %5.3f volts temp %d C adv %d time %4.1f sec rssi %s',[TlmVersion,TlmBattery*0.001,TlmTemperature,TlmAdvCount,TlmSecCount*0.1,dBm(Rssi)]));
+           end;
     end;
   end;
  // else
@@ -655,14 +730,23 @@ begin
 
  if IsBlueToothAvailable then
   begin
+   CommandMode:=True;
    OpenUart0;
    ResetChip;
    BCMLoadFirmware(BluetoothMiniDriverFileName);
    Log('Init complete');
    SetLEEventMask($ff);
+   UpdatingBeacon:=False;
+   BeaconMode:=True;
    StartLeAdvertising;
    StartPassiveScanning;
    Log('Receiving scan data');
+   Idle:=True;
+   Margin:=0;
+   while Idle do
+    ParseEvent;
+   Margin:=10*1000*1000;
+   UpdatingBeacon:=True;
    while True do
     ParseEvent;
   end;
