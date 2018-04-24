@@ -57,9 +57,10 @@ type
 var 
  BluetoothUartDeviceDescription:String;
  BluetoothMiniDriverFileName:String;
- CommandMode,UpdatingBeacon,BeaconMode:Boolean;
- Margin,StartTime:LongWord;
+ ScanCycleCounter:LongWord;
  Idle:Boolean;
+ StartTime:LongWord;
+ Margin:LongWord;
  AdData : array of byte;
  FWHandle:integer;
  HciSequenceNumber:Integer = 0;
@@ -285,6 +286,7 @@ var
  EddystoneServiceData:Array of Byte;
  I:Integer;
  UpTime:LongWord;
+ Temperature:Double;
 const 
  Part1 = 'ultibo';
 procedure AddByte(X:Byte);
@@ -306,7 +308,7 @@ begin
  SetLength(EddystoneServiceData,0);
  AddByte(Lo(EddystoneUuid));
  AddByte(Hi(EddystoneUuid));
- if BeaconMode then
+ if (ScanCycleCounter mod 6) = 0 then
   begin
    AddByte($10);
    AddByte($00);
@@ -317,13 +319,14 @@ begin
   end
  else
   begin
-   UpTime:=ClockGetCount div (100*1000);
+   UpTime:=ClockGetCount;
+   Temperature:=TemperatureGetCurrent(TEMPERATURE_ID_SOC) / 1000;
    AddByte($20);
    AddByte($00);
    AddWord(4993);
-   AddWord(TemperatureGetCurrent(0));
-   AddWord(UpTime div 100);
-   AddLongWord(UpTime);
+   AddWord((Trunc(Temperature) shl 8) or Round((Temperature - Trunc(Temperature))*100));
+   AddLongWord(UpTime div (1*1000*1000));
+   AddLongWord(UpTime div (100*1000));
   end;
  ClearAdvertisingData;
  AddAdvertisingData(ADT_FLAGS,[$18]);
@@ -349,10 +352,9 @@ begin
  SetLEAdvertisingParameters(1000,1000,ADV_IND,$00,$00,ZeroAddress,$07,$00);
  UpdateBeacon;
  StartUndirectedAdvertising;
- CommandMode:=False;
 end;
 
-function ReadByte:Byte;
+function EventReadFirstByte:Byte;
 var 
  c:LongWord;
  b:Byte;
@@ -371,33 +373,54 @@ begin
     begin
      Result:=b;
      Inc(ReadByteCounter);
-     if (not CommandMode) and Idle then
+     if Idle then
       begin
        Idle:=False;
        StartTime:=Now;
-       if (Margin <> 0) and (Now - EntryTime < Margin) then
+       if (ScanCycleCounter >= 1) and ((Now - EntryTime) < Margin) then
         begin
          Margin:=Now - EntryTime;
-         Log(Format('Lowest scanning margin is now %5.2f seconds',[Margin / (1*1000*1000)]));
+         Log(Format('Lowest margin is now %5.3f seconds',[Margin / (1*1000*1000)]));
         end;
       end;
      exit;
     end
    else
     begin
-     if (not CommandMode) and (not Idle) and (((Now - StartTime)/(1*1000*1000))  > (ScanWindow + 0.100))  then
+     if (not Idle) and (((Now - StartTime)/(1*1000*1000))  > (ScanWindow + 0.100))  then
       begin
        Idle:=True;
-       if UpdatingBeacon then
-        begin
-         CommandMode:=True;
-         StopAdvertising;
-         BeaconMode:=not BeaconMode;
-         StartLeAdvertising;
-        end;
+       Inc(ScanCycleCounter);
+       StopAdvertising;
+       StartLeAdvertising;
       end;
      ThreadYield;
     end;
+  end;
+ Fail('timeout waiting for serial read byte');
+end;
+
+function ReadByte:Byte;
+var 
+ c:LongWord;
+ b:Byte;
+ res:Integer;
+ EntryTime:LongWord;
+begin
+ Result:=0;
+ EntryTime:=ClockGetCount;
+ while ClockGetCount - EntryTime < 10*1000*1000 do
+  begin
+   c:=0;
+   res:=SerialDeviceRead(UART0,@b,1,SERIAL_READ_NON_BLOCK,c);
+   if (res = ERROR_SUCCESS) and (c = 1) then
+    begin
+     Result:=b;
+     Inc(ReadByteCounter);
+     exit;
+    end
+   else
+    ThreadYield;
   end;
  Fail('timeout waiting for serial read byte');
 end;
@@ -660,7 +683,7 @@ begin
  Result:=GetWord or (Result shl 16);
 end;
 begin
- EventType:=ReadByte;
+ EventType:=EventReadFirstByte;
  EventSubtype:=Readbyte;
  EventLength:=ReadByte;
  SetLength(Event,0);
@@ -671,6 +694,7 @@ begin
    Event[I - 1]:=ReadByte;
    S:=S+Event[I - 1].ToHexString(2) + ' ';
   end;
+
  if (EventLength = 31) or (EventLength = 37) then
   begin
    GetByteIndex:=18;
@@ -695,7 +719,7 @@ begin
           S:=S + Char(C);
         end;
        Rssi:=GetByte;
-       Log(Format('eddystone url %s tx power %s rssi %s',[S,dBm(TransmitPower),dBm(Rssi)]));
+       Log(Format('%d minutes eddystone url %s tx power %s rssi %s',[ClockGetCount div (60*1000*1000),S,dBm(TransmitPower),dBm(Rssi)]));
       end
      else if EddystoneType = $20 then
            begin
@@ -705,7 +729,7 @@ begin
             TlmAdvCount:=GetLongWord;
             TlmSecCount:=GetLongWord;
             Rssi:=GetByte;
-            Log(Format('eddystone unencrypted tlm ver %02.2x Battery %5.3f volts temp %d C adv %d time %4.1f sec rssi %s',[TlmVersion,TlmBattery*0.001,TlmTemperature,TlmAdvCount,TlmSecCount*0.1,dBm(Rssi)]));
+            Log(Format('eddystone unencrypted tlm ver %02.2x Battery %5.3f volts temp %d.%02.2d C adv %d time %4.1f sec rssi %s',[TlmVersion,TlmBattery*0.001,(TlmTemperature shr 8),TlmTemperature and $ff,TlmAdvCount,TlmSecCount*0.1,dBm(Rssi)]));
            end;
     end;
   end;
@@ -730,23 +754,17 @@ begin
 
  if IsBlueToothAvailable then
   begin
-   CommandMode:=True;
    OpenUart0;
    ResetChip;
    BCMLoadFirmware(BluetoothMiniDriverFileName);
    Log('Init complete');
    SetLEEventMask($ff);
-   UpdatingBeacon:=False;
-   BeaconMode:=True;
    StartLeAdvertising;
+   ScanCycleCounter:=0;
+   Margin:=High(Margin);
    StartPassiveScanning;
    Log('Receiving scan data');
    Idle:=True;
-   Margin:=0;
-   while Idle do
-    ParseEvent;
-   Margin:=10*1000*1000;
-   UpdatingBeacon:=True;
    while True do
     ParseEvent;
   end;
