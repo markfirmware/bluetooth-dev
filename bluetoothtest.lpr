@@ -1,11 +1,14 @@
 program BluetoothTest;
 {$mode objfpc}{$H+}
 
+//{$define USE_WEB_STATUS}
+
 uses 
 {$ifdef BUILD_RPI } BCM2708,BCM2835, {$endif}
 {$ifdef BUILD_RPI2} BCM2709,BCM2836, {$endif}
 {$ifdef BUILD_RPI3} BCM2710,BCM2837, {$endif}
-GlobalConfig,GlobalConst,GlobalTypes,Platform,Threads,SysUtils,Classes,Console,Logging,Ultibo,HTTP,WebStatus,
+GlobalConfig,GlobalConst,GlobalTypes,Platform,Threads,SysUtils,Classes,Console,Logging,Ultibo,
+{$ifdef USE_WEB_STATUS} HTTP,WebStatus,SMSC95XX, {$endif}
 Serial,DWCOTG,FileSystem,MMC,FATFS,Keyboard;
 
 const 
@@ -61,17 +64,25 @@ var
  Idle:Boolean;
  StartTime:LongWord;
  Margin:LongWord;
- AdData : array of byte;
+ ReadBackLog:Integer;
+ LastDeviceStatus:LongWord;
+ SerialDeviceStatusEntryCounter,SerialDeviceStatusExitCounter:LongWord;
+ EnableSerialDeviceStatus:Boolean;
+ AdData:Array of Byte;
  FWHandle:integer;
  HciSequenceNumber:Integer = 0;
  Console1:TWindowHandle;
  ch:char;
  UART0:PSerialDevice = Nil;
  KeyboardLoopHandle:TThreadHandle = INVALID_HANDLE_VALUE;
- HTTPListener:THTTPListener;
+ MonitorLoopHandle:TThreadHandle = INVALID_HANDLE_VALUE;
  ReadByteCounter:Integer = 0;
  Scheme:Array[0..3] of String = ('http://www.','https://www.','http://','https://');
  Expansion:Array[0..13] of String = ('.com/','.org/','.edu/','.net/','.info/','.biz','.gov/','.com','.org','.edu','.net','.info','.biz','.gov');
+
+{$ifdef USE_WEB_STATUS}
+ HTTPListener:THTTPListener;
+{$endif}
 
 function ReadByte:Byte; forward;
 procedure StopAdvertising; forward;
@@ -285,7 +296,7 @@ procedure UpdateBeacon;
 var 
  EddystoneServiceData:Array of Byte;
  I:Integer;
- UpTime:LongWord;
+ UpTime:Int64;
  Temperature:Double;
 const 
  Part1 = 'ultibo';
@@ -319,7 +330,7 @@ begin
   end
  else
   begin
-   UpTime:=ClockGetCount;
+   UpTime:=ClockGetTotal;
    Temperature:=TemperatureGetCurrent(TEMPERATURE_ID_SOC) / 1000;
    AddByte($20);
    AddByte($00);
@@ -380,17 +391,18 @@ begin
        if (ScanCycleCounter >= 1) and ((Now - EntryTime) < Margin) then
         begin
          Margin:=Now - EntryTime;
-         Log(Format('Lowest margin is now %5.3f seconds',[Margin / (1*1000*1000)]));
+         LoggingOutput(Format('lowest available processing time between scans is now %5.3f seconds',[Margin / (1*1000*1000)]));
         end;
       end;
      exit;
     end
    else
     begin
-     if (not Idle) and (((Now - StartTime)/(1*1000*1000))  > (ScanWindow + 0.100))  then
+     if (not Idle) and (((Now - StartTime)/(1*1000*1000))  > (ScanWindow + 0.500))  then
       begin
        Idle:=True;
        Inc(ScanCycleCounter);
+       Log(Format('%d bytes read',[ReadByteCounter]));
        StopAdvertising;
        StartLeAdvertising;
       end;
@@ -406,6 +418,7 @@ var
  b:Byte;
  res:Integer;
  EntryTime:LongWord;
+ SerialStatus:LongWord;
 begin
  Result:=0;
  EntryTime:=ClockGetCount;
@@ -417,6 +430,24 @@ begin
     begin
      Result:=b;
      Inc(ReadByteCounter);
+     res:=SerialDeviceRead(UART0,@b,1,SERIAL_READ_PEEK_BUFFER,c);
+     if c > ReadBackLog then
+      begin
+       ReadBackLog:=c;
+       LoggingOutput(Format('highest SERIAL_READ_PEEK_BUFFER is now %d',[ReadBackLog]));
+      end;
+     if EnableSerialDeviceStatus then
+      begin
+       Inc(SerialDeviceStatusEntryCounter);
+       SerialStatus:=SerialDeviceStatus(UART0);
+       Inc(SerialDeviceStatusExitCounter);
+       SerialStatus:=SerialStatus and not (SERIAL_STATUS_RX_EMPTY or SERIAL_STATUS_TX_EMPTY);
+       if SerialStatus <> LastDeviceStatus then
+        begin
+         LastDeviceStatus:=SerialStatus;
+         LoggingOutput(Format('SerialDeviceStatus changed %08.8x',[SerialStatus]));
+        end;
+      end;
      exit;
     end
    else
@@ -466,10 +497,15 @@ begin
    Log('Can''t find UART0');
    exit;
   end;
- res:=SerialDeviceOpen(UART0,115200,SERIAL_DATA_8BIT,SERIAL_STOP_1BIT,SERIAL_PARITY_NONE,SERIAL_FLOW_NONE,0,0);
+ res:=SerialDeviceOpen(UART0,115200,SERIAL_DATA_8BIT,SERIAL_STOP_1BIT,SERIAL_PARITY_NONE,SERIAL_FLOW_NONE,8*1024,8*1024);
  if res = ERROR_SUCCESS then
   begin
    Result:=True;
+   ReadBackLog:=0;
+   LastDeviceStatus:=0;
+   SerialDeviceStatusEntryCounter:=0;
+   SerialDeviceStatusExitCounter:=0;
+
    GPIOFunctionSelect(GPIO_PIN_14,GPIO_FUNCTION_IN);
    GPIOFunctionSelect(GPIO_PIN_15,GPIO_FUNCTION_IN);
 
@@ -594,6 +630,27 @@ begin
  AddHCICommand(OGF_LE_CONTROL,$01,Params);
 end;
 
+function MonitorLoop(Parameter:Pointer):PtrInt;
+var 
+ Capture:LongWord;
+begin
+ Result:=0;
+ while True do
+  begin
+   Sleep(1*1000);
+   if SerialDeviceStatusExitCounter <> SerialDeviceStatusEntryCounter then
+    begin
+     Capture:=SerialDeviceStatusExitCounter;
+     Sleep(2*1000);
+     if SerialDeviceStatusExitCounter = Capture then
+      begin
+       LoggingOutput(Format('SerialDeviceStatus entry %d exit %d',[SerialDeviceStatusEntryCounter,SerialDeviceStatusExitCounter]));
+       exit;
+      end;
+    end;
+  end;
+end;
+
 function KeyboardLoop(Parameter:Pointer):PtrInt;
 begin
  Result:=0;
@@ -694,7 +751,6 @@ begin
    Event[I - 1]:=ReadByte;
    S:=S+Event[I - 1].ToHexString(2) + ' ';
   end;
-
  if (EventLength = 31) or (EventLength = 37) then
   begin
    GetByteIndex:=18;
@@ -719,7 +775,7 @@ begin
           S:=S + Char(C);
         end;
        Rssi:=GetByte;
-       Log(Format('%d minutes eddystone url %s tx power %s rssi %s',[ClockGetCount div (60*1000*1000),S,dBm(TransmitPower),dBm(Rssi)]));
+       Log(Format('%d minutes eddystone url %s tx power %s rssi %s',[ClockGetTotal div (60*1000*1000),S,dBm(TransmitPower),dBm(Rssi)]));
       end
      else if EddystoneType = $20 then
            begin
@@ -743,14 +799,18 @@ begin
  RestoreBootFile('default','config.txt');
  StartLogging;
  BeginThread(@KeyboardLoop,Nil,KeyboardLoopHandle,THREAD_STACK_DEFAULT_SIZE);
+ BeginThread(@MonitorLoop,Nil,MonitorLoopHandle,THREAD_STACK_DEFAULT_SIZE);
 
  Log('Q - Quit - use default-config.txt');
  Log('R - Restart - use bluetooth-dev-bluetoothtest-config.txt');
  WaitForSDDrive;
 
+{$ifdef USE_WEB_STATUS}
  HTTPListener:=THTTPListener.Create;
  HTTPListener.Active:=True;
+ WEBSTATUS_FONT_NAME:='Monospace';
  WebStatusRegister(HTTPListener,'','',True);
+{$endif}
 
  if IsBlueToothAvailable then
   begin
@@ -765,6 +825,7 @@ begin
    StartPassiveScanning;
    Log('Receiving scan data');
    Idle:=True;
+   EnableSerialDeviceStatus:=True;
    while True do
     ParseEvent;
   end;
