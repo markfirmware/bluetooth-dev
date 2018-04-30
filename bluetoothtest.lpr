@@ -58,16 +58,19 @@ type
  TBDAddr = Array[0 .. BDADDR_LEN - 1] of Byte;
 
 var 
+ ExceptionRestartCounter:Integer;
+ DropByte:Boolean;
  BluetoothUartDeviceDescription:String;
  BluetoothMiniDriverFileName:String;
  ScanCycleCounter:LongWord;
- Idle:Boolean;
+ ScanIdle:Boolean;
  StartTime:LongWord;
  Margin:LongWord;
  ReadBackLog:Integer;
  LastDeviceStatus:LongWord;
  SerialDeviceStatusEntryCounter,SerialDeviceStatusExitCounter:LongWord;
  EnableSerialDeviceStatus:Boolean;
+ DisableThreadYield:Boolean;
  AdData:Array of Byte;
  FWHandle:integer;
  HciSequenceNumber:Integer = 0;
@@ -189,9 +192,7 @@ end;
 
 procedure Fail(Message:String);
 begin
- Log(Message);
- while True do
-  Sleep(1*1000);
+ raise Exception.Create(Message);
 end;
 
 procedure ClearAdvertisingData;
@@ -230,7 +231,7 @@ begin
  AddAdvertisingData (Type_, []);
 end;
 
-procedure AddHCICommand(OpCode:Word; Params:array of byte);
+procedure HciCommand(OpCode:Word; Params:array of byte);
 var 
  i:integer;
  Cmd:array of byte;
@@ -273,9 +274,9 @@ begin
   Log('Error writing to BT.');
 end;
 
-procedure AddHCICommand(OGF:byte; OCF:Word; Params:array of byte);
+procedure HciCommand(OGF:byte; OCF:Word; Params:array of byte);
 begin
- AddHCICommand((OGF shl 10) or OCF,Params);
+ HciCommand((OGF shl 10) or OCF,Params);
 end;
 
 procedure SetLEAdvertisingData(Data:array of byte);
@@ -289,7 +290,7 @@ begin
  Params[0]:=Len;
  for i:=0 to Len - 1 do
   Params[i + 1]:=Data[i];
- AddHCICommand(OGF_LE_CONTROL,$08,Params);
+ HciCommand(OGF_LE_CONTROL,$08,Params);
 end;
 
 procedure UpdateBeacon;
@@ -348,7 +349,7 @@ end;
 
 procedure SetLEAdvertisingParameters(MinInterval,MaxInterval:Word; Type_:byte; OwnAddressType,PeerAddressType:byte; PeerAddr:TBDAddr; ChannelMap,FilterPolicy:byte);
 begin
- AddHCICommand(OGF_LE_CONTROL,$06,[lo(MinInterval),hi(MinInterval),
+ HciCommand(OGF_LE_CONTROL,$06,[lo(MinInterval),hi(MinInterval),
  lo(MaxInterval),hi(MaxInterval),
  Type_,OwnAddressType,PeerAddressType,
  PeerAddr[0],PeerAddr[1],PeerAddr[2],
@@ -363,6 +364,12 @@ begin
  SetLEAdvertisingParameters(1000,1000,ADV_IND,$00,$00,ZeroAddress,$07,$00);
  UpdateBeacon;
  StartUndirectedAdvertising;
+end;
+
+procedure EndOfScan;
+begin
+ StopAdvertising;
+ StartLeAdvertising;
 end;
 
 function EventReadFirstByte:Byte;
@@ -384,9 +391,9 @@ begin
     begin
      Result:=b;
      Inc(ReadByteCounter);
-     if Idle then
+     if ScanIdle then
       begin
-       Idle:=False;
+       ScanIdle:=False;
        StartTime:=Now;
        if (ScanCycleCounter >= 1) and ((Now - EntryTime) < Margin) then
         begin
@@ -398,13 +405,12 @@ begin
     end
    else
     begin
-     if (not Idle) and (((Now - StartTime)/(1*1000*1000))  > (ScanWindow + 0.500))  then
+     if (not ScanIdle) and (((Now - StartTime)/(1*1000*1000))  > (ScanWindow + 0.500))  then
       begin
-       Idle:=True;
+       ScanIdle:=True;
        Inc(ScanCycleCounter);
        Log(Format('%d bytes read',[ReadByteCounter]));
-       StopAdvertising;
-       StartLeAdvertising;
+       EndOfScan;
       end;
      ThreadYield;
     end;
@@ -419,15 +425,21 @@ var
  res:Integer;
  EntryTime:LongWord;
  SerialStatus:LongWord;
+ I:Integer;
 begin
  Result:=0;
  EntryTime:=ClockGetCount;
- while ClockGetCount - EntryTime < 10*1000*1000 do
+ while ClockGetCount - EntryTime < 1*1000*1000 do
   begin
    c:=0;
    res:=SerialDeviceRead(UART0,@b,1,SERIAL_READ_NON_BLOCK,c);
    if (res = ERROR_SUCCESS) and (c = 1) then
     begin
+     if DropByte then
+      begin
+       DropByte:=False;
+       break;
+      end;
      Result:=b;
      Inc(ReadByteCounter);
      res:=SerialDeviceRead(UART0,@b,1,SERIAL_READ_PEEK_BUFFER,c);
@@ -438,9 +450,14 @@ begin
       end;
      if EnableSerialDeviceStatus then
       begin
-       Inc(SerialDeviceStatusEntryCounter);
-       SerialStatus:=SerialDeviceStatus(UART0);
-       Inc(SerialDeviceStatusExitCounter);
+       for I:=1 to 1 do
+        begin
+         Inc(SerialDeviceStatusEntryCounter);
+         if not DisableThreadYield then
+          ThreadYield;
+         SerialStatus:=SerialDeviceStatus(UART0);
+         Inc(SerialDeviceStatusExitCounter);
+        end;
        SerialStatus:=SerialStatus and not (SERIAL_STATUS_RX_EMPTY or SERIAL_STATUS_TX_EMPTY);
        if SerialStatus <> LastDeviceStatus then
         begin
@@ -497,7 +514,7 @@ begin
    Log('Can''t find UART0');
    exit;
   end;
- res:=SerialDeviceOpen(UART0,115200,SERIAL_DATA_8BIT,SERIAL_STOP_1BIT,SERIAL_PARITY_NONE,SERIAL_FLOW_NONE,8*1024,8*1024);
+ res:=SerialDeviceOpen(UART0,115200,SERIAL_DATA_8BIT,SERIAL_STOP_1BIT,SERIAL_PARITY_NONE,SERIAL_FLOW_NONE,0,0);
  if res = ERROR_SUCCESS then
   begin
    Result:=True;
@@ -521,7 +538,7 @@ end;
 
 procedure ResetChip;
 begin
- AddHCICommand(OGF_HOST_CONTROL,$03,[]);
+ HciCommand(OGF_HOST_CONTROL,$03,[]);
 end;
 
 procedure CloseUART0;
@@ -541,7 +558,7 @@ begin
  if FWHandle > 0 then
   begin
    Log('Firmware load ...');
-   AddHCICommand(OGF_VENDOR,$2e,[]);
+   HciCommand(OGF_VENDOR,$2e,[]);
    n:=FSFileRead(FWHandle,hdr,3);
    while (n = 3) do
     begin
@@ -550,7 +567,7 @@ begin
      SetLength(Params,len);
      n:=FSFileRead(FWHandle,Params[0],len);
      if (len <> n) then Log('Data mismatch.');
-     AddHCICommand(Op,Params);
+     HciCommand(Op,Params);
      n:=FSFileRead(FWHandle,hdr,3);
     end;
    FSFileClose(FWHandle);
@@ -580,7 +597,7 @@ end;
 
 procedure SetLEScanParameters(Type_:byte;Interval,Window:Word;OwnAddressType,FilterPolicy:byte);
 begin
- AddHCICommand(OGF_LE_CONTROL,$0b,[Type_,lo(Interval),hi(Interval),lo(Window),hi(Window),OwnAddressType,FilterPolicy]);
+ HciCommand(OGF_LE_CONTROL,$0b,[Type_,lo(Interval),hi(Interval),lo(Window),hi(Window),OwnAddressType,FilterPolicy]);
 end;
 
 procedure SetLEScanEnable(State,Duplicates:boolean);
@@ -596,7 +613,7 @@ begin
   Params[1]:=$01
  else
   Params[1]:=$00;
- AddHCICommand(OGF_LE_CONTROL,$0c,Params);
+ HciCommand(OGF_LE_CONTROL,$0c,Params);
 end;
 
 procedure StartPassiveScanning;
@@ -627,7 +644,7 @@ begin
  Params[5]:=(MaskHi shr 8) and $ff;
  Params[6]:=(MaskHi shr 16) and $ff;
  Params[7]:=(MaskHi shr 24) and $ff;
- AddHCICommand(OGF_LE_CONTROL,$01,Params);
+ HciCommand(OGF_LE_CONTROL,$01,Params);
 end;
 
 function MonitorLoop(Parameter:Pointer):PtrInt;
@@ -638,9 +655,9 @@ begin
  while True do
   begin
    Sleep(1*1000);
-   if SerialDeviceStatusExitCounter <> SerialDeviceStatusEntryCounter then
+   Capture:=SerialDeviceStatusExitCounter;
+   if SerialDeviceStatusEntryCounter <> Capture then
     begin
-     Capture:=SerialDeviceStatusExitCounter;
      Sleep(2*1000);
      if SerialDeviceStatusExitCounter = Capture then
       begin
@@ -658,6 +675,9 @@ begin
   begin
    if ConsoleGetKey(ch,nil) then
     case uppercase(ch) of 
+     'T' : DisableThreadYield:=True;
+     'D' : DropByte:=True;
+     'S' : EnableSerialDeviceStatus:=True;
      'Q' : SystemRestart(0);
      'R' :
           begin
@@ -684,9 +704,9 @@ end;
 procedure SetLEAdvertisingEnable(State:boolean);
 begin
  if State then
-  AddHCICommand(OGF_LE_CONTROL,$0a,[$01])
+  HciCommand(OGF_LE_CONTROL,$0a,[$01])
  else
-  AddHCICommand(OGF_LE_CONTROL,$0a,[$00]);
+  HciCommand(OGF_LE_CONTROL,$0a,[$00]);
 end;
 
 procedure StartUndirectedAdvertising;
@@ -793,6 +813,49 @@ begin
  //  Log(Format('message %02.2x %02.2x %d bytes',[EventType,EventSubtype,EventLength]));
 end;
 
+procedure FlushRx;
+var 
+ Res:LongWord;
+ C:LongWord;
+ B:Byte;
+ TimeStamp:LongWord;
+begin
+ TimeStamp:=ClockGetCount;
+ while ClockGetCount - TimeStamp < 1*1000*1000 do
+  begin
+   Res:=SerialDeviceRead(UART0,@B,1,SERIAL_READ_NON_BLOCK,C);
+   if (Res = ERROR_SUCCESS) and (C = 1) then
+    TimeStamp:=ClockGetCount
+   else
+    Sleep(100);
+  end;
+end;
+
+procedure Flush(Message:String);
+begin
+ LoggingOutput(Format('Flush %s',[Message]));
+ FlushRx;
+ try
+  StopAdvertising;
+ except
+  on E:Exception do
+       begin
+        LoggingOutput(Format('Flush did not stop advertising %s',[E.Message]));
+        FlushRx;
+       end;
+end;
+try
+ StopScanning;
+except
+ on E:Exception do
+      begin
+       LoggingOutput(Format('Flush did not stop scanning %s',[E.Message]));
+       FlushRx;
+      end;
+end;
+FlushRx;
+end;
+
 begin
  Console1 := ConsoleWindowCreate(ConsoleDeviceGetDefault,CONSOLE_POSITION_LEFT,True);
  Log('Bluetooth Test');
@@ -801,6 +864,9 @@ begin
  BeginThread(@KeyboardLoop,Nil,KeyboardLoopHandle,THREAD_STACK_DEFAULT_SIZE);
  BeginThread(@MonitorLoop,Nil,MonitorLoopHandle,THREAD_STACK_DEFAULT_SIZE);
 
+ Log('T - Disable ThreadYield - disable ThreadYield when calling SerialDeviceStatus');
+ Log('S - Serial Status - enable SerialDeviceStatus');
+ Log('D - Drop Byte - drop one byte from the uart rx');
  Log('Q - Quit - use default-config.txt');
  Log('R - Restart - use bluetooth-dev-bluetoothtest-config.txt');
  WaitForSDDrive;
@@ -817,17 +883,32 @@ begin
    OpenUart0;
    ResetChip;
    BCMLoadFirmware(BluetoothMiniDriverFileName);
-   Log('Init complete');
    SetLEEventMask($ff);
-   StartLeAdvertising;
-   ScanCycleCounter:=0;
-   Margin:=High(Margin);
-   StartPassiveScanning;
-   Log('Receiving scan data');
-   Idle:=True;
-   EnableSerialDeviceStatus:=True;
+   Log('Init complete');
+   ExceptionRestartCounter:=0;
    while True do
-    ParseEvent;
+    begin
+     try
+      DropByte:=False;
+      EnableSerialDeviceStatus:=False;
+      DisableThreadYield:=False;
+      StartLeAdvertising;
+      ScanCycleCounter:=0;
+      Margin:=High(Margin);
+      StartPassiveScanning;
+      Log('Receiving scan data');
+      ScanIdle:=True;
+      while True do
+       ParseEvent;
+     except
+      on E:Exception do
+           begin
+            Inc(ExceptionRestartCounter);
+            LoggingOutput(Format('ExceptionRestartCounter %d',[ExceptionRestartCounter]));
+            Flush(E.Message);
+           end;
+    end;
   end;
- ThreadHalt(0);
+end;
+ThreadHalt(0);
 end.
