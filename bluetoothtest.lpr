@@ -1,7 +1,7 @@
 program BluetoothTest;
 {$mode objfpc}{$H+}
 
-//{$define USE_WEB_STATUS}
+{$define USE_WEB_STATUS}
 
 uses 
 {$ifdef BUILD_RPI } BCM2708,BCM2835, {$endif}
@@ -56,10 +56,14 @@ const
 
 type 
  TBDAddr = Array[0 .. BDADDR_LEN - 1] of Byte;
+ TBluetoothWebStatus = class(TWebStatusCustom)
+  function DoContent(AHost:THTTPHost;ARequest:THTTPServerRequest;AResponse:THTTPServerResponse):Boolean;override;
+ end;
 
 var 
  ExceptionRestartCounter:Integer;
  DropByte:Boolean;
+ RestartBroadcastObserveLoop:Boolean;
  BluetoothUartDeviceDescription:String;
  BluetoothMiniDriverFileName:String;
  ScanCycleCounter:LongWord;
@@ -67,10 +71,9 @@ var
  StartTime:LongWord;
  Margin:LongWord;
  ReadBackLog:Integer;
+ BluetoothWebStatus:TBluetoothWebStatus;
  LastDeviceStatus:LongWord;
  SerialDeviceStatusEntryCounter,SerialDeviceStatusExitCounter:LongWord;
- EnableSerialDeviceStatus:Boolean;
- DisableThreadYield:Boolean;
  AdData:Array of Byte;
  FWHandle:integer;
  HciSequenceNumber:Integer = 0;
@@ -79,7 +82,7 @@ var
  UART0:PSerialDevice = Nil;
  KeyboardLoopHandle:TThreadHandle = INVALID_HANDLE_VALUE;
  MonitorLoopHandle:TThreadHandle = INVALID_HANDLE_VALUE;
- ReadByteCounter:Integer = 0;
+ ReadByteCounter:Integer;
  Scheme:Array[0..3] of String = ('http://www.','https://www.','http://','https://');
  Expansion:Array[0..13] of String = ('.com/','.org/','.edu/','.net/','.info/','.biz','.gov/','.com','.org','.edu','.net','.info','.biz','.gov');
 
@@ -107,6 +110,14 @@ begin
  if FileExists(Source) then
   CopyFile(PChar(Source),PChar(FileName),False);
  Log(Format('Restoring from %s done',[Source]));
+end;
+
+function TBluetoothWebStatus.DoContent(AHost:THTTPHost;ARequest:THTTPServerRequest;AResponse:THTTPServerResponse):Boolean;
+begin
+ AddItem(AResponse,'ExceptionRestartCounter',ExceptionRestartCounter.ToString);
+ AddItem(AResponse,'ScanCycleCounter',ScanCycleCounter.ToString);
+ AddItem(AResponse,'ReadByteCounter',ReadByteCounter.ToString);
+ Result:=True;
 end;
 
 function ogf(op:Word):byte;
@@ -425,7 +436,6 @@ var
  res:Integer;
  EntryTime:LongWord;
  SerialStatus:LongWord;
- I:Integer;
 begin
  Result:=0;
  EntryTime:=ClockGetCount;
@@ -448,22 +458,14 @@ begin
        ReadBackLog:=c;
        LoggingOutput(Format('highest SERIAL_READ_PEEK_BUFFER is now %d',[ReadBackLog]));
       end;
-     if EnableSerialDeviceStatus then
+     Inc(SerialDeviceStatusEntryCounter);
+     SerialStatus:=SerialDeviceStatus(UART0);
+     Inc(SerialDeviceStatusExitCounter);
+     SerialStatus:=SerialStatus and not (SERIAL_STATUS_RX_EMPTY or SERIAL_STATUS_TX_EMPTY);
+     if SerialStatus <> LastDeviceStatus then
       begin
-       for I:=1 to 1 do
-        begin
-         Inc(SerialDeviceStatusEntryCounter);
-         if not DisableThreadYield then
-          ThreadYield;
-         SerialStatus:=SerialDeviceStatus(UART0);
-         Inc(SerialDeviceStatusExitCounter);
-        end;
-       SerialStatus:=SerialStatus and not (SERIAL_STATUS_RX_EMPTY or SERIAL_STATUS_TX_EMPTY);
-       if SerialStatus <> LastDeviceStatus then
-        begin
-         LastDeviceStatus:=SerialStatus;
-         LoggingOutput(Format('SerialDeviceStatus changed %08.8x',[SerialStatus]));
-        end;
+       LastDeviceStatus:=SerialStatus;
+       LoggingOutput(Format('SerialDeviceStatus changed %08.8x',[SerialStatus]));
       end;
      exit;
     end
@@ -668,6 +670,15 @@ begin
   end;
 end;
 
+procedure Help;
+begin
+ Log('H - Help - display this help message');
+ Log('L - Loop - restart the broadcast/observe loop');
+ Log('D - Drop Byte - drop one byte from the uart rx');
+ Log('Q - Quit - use default-config.txt');
+ Log('R - Restart - use bluetooth-dev-bluetoothtest-config.txt');
+end;
+
 function KeyboardLoop(Parameter:Pointer):PtrInt;
 begin
  Result:=0;
@@ -675,9 +686,9 @@ begin
   begin
    if ConsoleGetKey(ch,nil) then
     case uppercase(ch) of 
-     'T' : DisableThreadYield:=True;
+     'H' : Help;
+     'L' : RestartBroadcastObserveLoop:=True;
      'D' : DropByte:=True;
-     'S' : EnableSerialDeviceStatus:=True;
      'Q' : SystemRestart(0);
      'R' :
           begin
@@ -863,12 +874,7 @@ begin
  StartLogging;
  BeginThread(@KeyboardLoop,Nil,KeyboardLoopHandle,THREAD_STACK_DEFAULT_SIZE);
  BeginThread(@MonitorLoop,Nil,MonitorLoopHandle,THREAD_STACK_DEFAULT_SIZE);
-
- Log('T - Disable ThreadYield - disable ThreadYield when calling SerialDeviceStatus');
- Log('S - Serial Status - enable SerialDeviceStatus');
- Log('D - Drop Byte - drop one byte from the uart rx');
- Log('Q - Quit - use default-config.txt');
- Log('R - Restart - use bluetooth-dev-bluetoothtest-config.txt');
+ Help;
  WaitForSDDrive;
 
 {$ifdef USE_WEB_STATUS}
@@ -876,29 +882,33 @@ begin
  HTTPListener.Active:=True;
  WEBSTATUS_FONT_NAME:='Monospace';
  WebStatusRegister(HTTPListener,'','',True);
+ BluetoothWebStatus:=TBluetoothWebStatus.Create('Bluetooth','/bluetooth',2);
+ HTTPListener.RegisterDocument('',BluetoothWebStatus);
 {$endif}
 
  if IsBlueToothAvailable then
   begin
+   ReadByteCounter:=0;
    OpenUart0;
    ResetChip;
    BCMLoadFirmware(BluetoothMiniDriverFileName);
    SetLEEventMask($ff);
    Log('Init complete');
    ExceptionRestartCounter:=0;
+   ReadByteCounter:=0;
    while True do
     begin
      try
+      RestartBroadcastObserveLoop:=False;
+      ReadBackLog:=0;
       DropByte:=False;
-      EnableSerialDeviceStatus:=False;
-      DisableThreadYield:=False;
       StartLeAdvertising;
       ScanCycleCounter:=0;
       Margin:=High(Margin);
       StartPassiveScanning;
       Log('Receiving scan data');
       ScanIdle:=True;
-      while True do
+      while not RestartBroadcastObserveLoop do
        ParseEvent;
      except
       on E:Exception do
