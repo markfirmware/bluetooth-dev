@@ -1,5 +1,5 @@
 program BluetoothTest;
-{$mode objfpc}{$H+}
+{$mode objfpc}{$modeswitch advancedrecords}{$H+}
 
 {$define USE_WEB_STATUS}
 
@@ -59,6 +59,17 @@ type
  TBluetoothWebStatus = class(TWebStatusCustom)
   function DoContent(AHost:THTTPHost;ARequest:THTTPServerRequest;AResponse:THTTPServerResponse):Boolean;override;
  end;
+ TMessage = record
+  Data:String;
+  TimeStamp:LongWord;
+  Rssi:Byte;
+ end;
+ TMessageTrack = record
+  Key:String;
+  Count:Integer;
+  First:TMessage;
+  Last:TMessage;
+ end;
 
 var 
  ExceptionRestartCounter:Integer;
@@ -74,10 +85,11 @@ var
  BluetoothWebStatus:TBluetoothWebStatus;
  LastDeviceStatus:LongWord;
  SerialDeviceStatusEntryCounter,SerialDeviceStatusExitCounter:LongWord;
+ MessageTrackList:Array of TMessageTrack;
  AdData:Array of Byte;
  FWHandle:integer;
  HciSequenceNumber:Integer = 0;
- Console1:TWindowHandle;
+ Console1,Console2:TWindowHandle;
  ch:char;
  UART0:PSerialDevice = Nil;
  KeyboardLoopHandle:TThreadHandle = INVALID_HANDLE_VALUE;
@@ -254,7 +266,7 @@ begin
  //  Log(Format('hci %d op %04.4x',[HciSequenceNumber,OpCode]));
  SetLength(Cmd,length(Params) + 4);
  Cmd[0]:=HCI_COMMAND_PKT;
- Cmd[1]:=lo(OpCode);          // little endian so lowest sent first
+ Cmd[1]:=lo(OpCode);
  Cmd[2]:=hi(OpCode);
  Cmd[3]:=length(Params);
  for i:=0 to length(Params) - 1 do
@@ -377,10 +389,66 @@ begin
  StartUndirectedAdvertising;
 end;
 
+function dBm(Rssi:Byte):String;
+var 
+ si:String;
+begin
+ if Rssi = 127 then si := 'NU'
+ else if Rssi > 128 then si := '-' + IntToStr (256 - Rssi) + ' dBm'
+ else if Rssi <= 20 then si := '+' + IntToStr (Rssi) + ' dBm'
+ else si := '? dBm';
+ Result:=si;
+end;
+
 procedure EndOfScan;
+var 
+ Now:LongWord;
+ I:Integer;
+const 
+ Limit = 70*1000*1000;
+procedure Cull;
+var 
+ NewList:Array of TMessageTrack;
+ Track:TMessageTrack;
+ I:Integer;
+begin
+ SetLength(NewList,0);
+ for I:=0 to High(MessageTrackList) do
+  begin
+   Track:=MessageTrackList[I];
+   if Now - Track.Last.TimeStamp <= Limit then
+    begin
+     SetLength(NewList,Length(NewList) + 1);
+     NewList[Length(NewList) - 1]:=Track;
+    end;
+  end;
+ MessageTrackList:=NewList;
+end;
 begin
  StopAdvertising;
  StartLeAdvertising;
+ Now:=ClockGetCount;
+ for I:=0 to High(MessageTrackList) do
+  with MessageTrackList[I] do
+   if Now - Last.TimeStamp > Limit then
+    begin
+     Cull;
+     break;
+    end;
+ ConsoleWindowSetXY(Console2,1,1);
+ for I:=High(MessageTrackList) downto 0 do
+  with MessageTrackList[I] do
+   begin
+    if Now - Last.TimeStamp > Limit - 15*1000*1000 then
+     ConsoleWindowSetForecolor(Console2,COLOR_RED)
+    else if Now - Last.TimeStamp > Limit - 30*1000*1000 then
+          ConsoleWindowSetForecolor(Console2,COLOR_GRAY);
+    ConsoleWindowWrite(Console2,Format('%s %4d %s %s',[dBm(Last.Rssi),Count,Key,Last.Data]));
+    ConsoleWindowSetForecolor(Console2,COLOR_YELLOW);
+    ConsoleWindowClearEx(Console2,ConsoleWindowGetX(Console2),ConsoleWindowGetY(Console2),ConsoleWindowGetMaxX(Console2),ConsoleWindowGetY(Console2),False);
+    ConsoleWindowWriteLn(Console2,'');
+   end;
+ ConsoleWindowClearEx(Console2,ConsoleWindowGetX(Console2),ConsoleWindowGetY(Console2),ConsoleWindowGetMaxX(Console2),ConsoleWindowGetMaxY(Console2),False);
 end;
 
 function EventReadFirstByte:Byte;
@@ -406,10 +474,10 @@ begin
       begin
        ScanIdle:=False;
        StartTime:=Now;
-       if (ScanCycleCounter >= 1) and ((Now - EntryTime) < Margin) then
+       if (ScanCycleCounter >= 1) and ((Now - EntryTime) div 1000 < Margin) then
         begin
-         Margin:=Now - EntryTime;
-         LoggingOutput(Format('lowest available processing time between scans is now %5.3f seconds',[Margin / (1*1000*1000)]));
+         Margin:=(Now - EntryTime) div 1000;
+         LoggingOutput(Format('lowest available processing time between scans is now %5.3fS',[Margin / 1000]));
         end;
       end;
      exit;
@@ -420,7 +488,6 @@ begin
       begin
        ScanIdle:=True;
        Inc(ScanCycleCounter);
-       Log(Format('%d bytes read',[ReadByteCounter]));
        EndOfScan;
       end;
      ThreadYield;
@@ -593,6 +660,7 @@ procedure StartLogging;
 begin
  LOGGING_INCLUDE_COUNTER:=False;
  CONSOLE_REGISTER_LOGGING:=True;
+ CONSOLE_LOGGING_POSITION:=CONSOLE_POSITION_BOTTOMRIGHT;
  LoggingConsoleDeviceAdd(ConsoleDeviceGetDefault);
  LoggingDeviceSetDefault(LoggingDeviceFindByType(LOGGING_TYPE_CONSOLE));
 end;
@@ -731,15 +799,33 @@ begin
  SetLEAdvertisingEnable(false);
 end;
 
-function dBm(Rssi:Byte):String;
+procedure Track(NewTimeStamp:LongWord;NewRssi:Byte;NewKey:String;NewData:String);
 var 
- si:String;
+ MessageTrack:TMessageTrack;
+ I,N:Integer;
 begin
- if Rssi = 127 then si := 'NU'
- else if Rssi > 128 then si := '-' + IntToStr (256 - Rssi) + ' dBm'
- else if Rssi <= 20 then si := '+' + IntToStr (Rssi) + ' dBm'
- else si := '? dBm';
- Result:=si;
+ for I:=0 to High(MessageTrackList) do
+  with MessageTrackList[I] do
+   if NewKey = Key then
+    begin
+     Inc(Count);
+     Last.Data:=NewData;
+     Last.TimeStamp:=NewTimeStamp;
+     Last.Rssi:=NewRssi;
+     exit;
+    end;
+ N:=Length(MessageTrackList);
+ SetLength(MessageTrackList,N + 1);
+ Inc(N);
+ for I:=N - 1 downto 1 do
+  MessageTrackList[I]:=MessageTrackList[I - 1];
+ MessageTrack.Key:=NewKey;
+ MessageTrack.Count:=1;
+ MessageTrack.First.Data:=NewData;
+ MessageTrack.First.TimeStamp:=NewTimeStamp;
+ MessageTrack.First.Rssi:=NewRssi;
+ MessageTrack.Last:=MessageTrack.First;
+ MessageTrackList[0]:=MessageTrack;
 end;
 
 procedure ParseEvent;
@@ -755,6 +841,7 @@ var
  Event:Array of Byte;
  S:String;
  GetByteIndex:Integer;
+ AddressString:String;
 function GetByte:Byte;
 begin
  Result:=Event[GetByteIndex];
@@ -782,8 +869,12 @@ begin
    Event[I - 1]:=ReadByte;
    S:=S+Event[I - 1].ToHexString(2) + ' ';
   end;
- if (EventLength = 31) or (EventLength = 37) then
+ if EventLength <= 37 then
   begin
+   GetByteIndex:=4;
+   AddressString:='';
+   for I:=1 to 6 do
+    AddressString:=GetByte.ToHexString(2) + AddressString;
    GetByteIndex:=18;
    EddystoneLength:=GetByte;
    AdType:=GetByte;
@@ -806,7 +897,7 @@ begin
           S:=S + Char(C);
         end;
        Rssi:=GetByte;
-       Log(Format('%d minutes eddystone url %s tx power %s rssi %s',[ClockGetTotal div (60*1000*1000),S,dBm(TransmitPower),dBm(Rssi)]));
+       Track(ClockGetCount,Rssi,Format('%s eddystone url %s tx %s',[AddressString,S,dBm(TransmitPower)]),'');
       end
      else if EddystoneType = $20 then
            begin
@@ -816,7 +907,7 @@ begin
             TlmAdvCount:=GetLongWord;
             TlmSecCount:=GetLongWord;
             Rssi:=GetByte;
-            Log(Format('eddystone unencrypted tlm ver %02.2x Battery %5.3f volts temp %d.%02.2d C adv %d time %4.1f sec rssi %s',[TlmVersion,TlmBattery*0.001,(TlmTemperature shr 8),TlmTemperature and $ff,TlmAdvCount,TlmSecCount*0.1,dBm(Rssi)]));
+            Track(ClockGetCount,Rssi,Format('%s tlm',[AddressString]),Format('ver %d battery %5.3fV temp %d.%02.2dC adv %d time %4.1fS',[TlmVersion,TlmBattery*0.001,(TlmTemperature shr 8),TlmTemperature and $ff,TlmAdvCount,TlmSecCount*0.1]));
            end;
     end;
   end;
@@ -868,8 +959,12 @@ FlushRx;
 end;
 
 begin
- Console1 := ConsoleWindowCreate(ConsoleDeviceGetDefault,CONSOLE_POSITION_LEFT,True);
- Log('Bluetooth Test');
+ Console1 := ConsoleWindowCreate(ConsoleDeviceGetDefault,CONSOLE_POSITION_TOPRIGHT,True);
+ Console2 := ConsoleWindowCreate(ConsoleDeviceGetDefault,CONSOLE_POSITION_LEFT,False);
+ ConsoleWindowSetBackcolor(Console2,COLOR_BLACK);
+ ConsoleWindowSetForecolor(Console2,COLOR_YELLOW);
+ ConsoleWindowClear(Console2);
+ Log('bluetooth-dev');
  RestoreBootFile('default','config.txt');
  StartLogging;
  BeginThread(@KeyboardLoop,Nil,KeyboardLoopHandle,THREAD_STACK_DEFAULT_SIZE);
@@ -895,6 +990,7 @@ begin
    SetLEEventMask($ff);
    Log('Init complete');
    ExceptionRestartCounter:=0;
+   ScanCycleCounter:=0;
    ReadByteCounter:=0;
    while True do
     begin
@@ -903,8 +999,8 @@ begin
       ReadBackLog:=0;
       DropByte:=False;
       StartLeAdvertising;
-      ScanCycleCounter:=0;
       Margin:=High(Margin);
+      SetLength(MessageTrackList,0);
       StartPassiveScanning;
       Log('Receiving scan data');
       ScanIdle:=True;
