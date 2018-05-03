@@ -7,7 +7,7 @@ uses
 {$ifdef BUILD_RPI } BCM2708,BCM2835, {$endif}
 {$ifdef BUILD_RPI2} BCM2709,BCM2836, {$endif}
 {$ifdef BUILD_RPI3} BCM2710,BCM2837, {$endif}
-GlobalConfig,GlobalConst,GlobalTypes,Platform,Threads,SysUtils,Classes,Console,Logging,Ultibo,
+GlobalConfig,GlobalConst,GlobalTypes,Platform,Threads,SysUtils,Classes,Console,Logging,Ultibo,WinSock2,
 {$ifdef USE_WEB_STATUS} HTTP,WebStatus,SMSC95XX, {$endif}
 Serial,DWCOTG,FileSystem,MMC,FATFS,Keyboard;
 
@@ -83,6 +83,10 @@ var
  Margin:LongWord;
  ReadBackLog:Integer;
  BluetoothWebStatus:TBluetoothWebStatus;
+ HtmlReportLock:TSemaphoreHandle;
+ HtmlReport:String;
+ IpAddress:String;
+ IpAddressAvailable:Boolean;
  LastDeviceStatus:LongWord;
  SerialDeviceStatusEntryCounter,SerialDeviceStatusExitCounter:LongWord;
  MessageTrackList:Array of TMessageTrack;
@@ -94,6 +98,7 @@ var
  UART0:PSerialDevice = Nil;
  KeyboardLoopHandle:TThreadHandle = INVALID_HANDLE_VALUE;
  MonitorLoopHandle:TThreadHandle = INVALID_HANDLE_VALUE;
+ IpAddressLoopHandle:TThreadHandle = INVALID_HANDLE_VALUE;
  ReadByteCounter:Integer;
  Scheme:Array[0..3] of String = ('http://www.','https://www.','http://','https://');
  Expansion:Array[0..13] of String = ('.com/','.org/','.edu/','.net/','.info/','.biz','.gov/','.com','.org','.edu','.net','.info','.biz','.gov');
@@ -125,10 +130,20 @@ begin
 end;
 
 function TBluetoothWebStatus.DoContent(AHost:THTTPHost;ARequest:THTTPServerRequest;AResponse:THTTPServerResponse):Boolean;
+var 
+ Report:String;
 begin
- AddItem(AResponse,'ExceptionRestartCounter',ExceptionRestartCounter.ToString);
- AddItem(AResponse,'ScanCycleCounter',ScanCycleCounter.ToString);
- AddItem(AResponse,'ReadByteCounter',ReadByteCounter.ToString);
+ AddContent(AResponse,'<div><big><big><b>This page reloads every 5 seconds</b></big></big></div>');
+ AddContent(AResponse,'<meta http-equiv="refresh" content="5">');
+ AddContent(AResponse,'ExceptionRestartCounter ' + ExceptionRestartCounter.ToString);
+ AddContent(AResponse,'ScanCycleCounter ' + ScanCycleCounter.ToString);
+ AddContent(AResponse,'ReadByteCounter ' + ReadByteCounter.ToString);
+ SemaphoreWait(HtmlReportLock);
+ Report:=HtmlReport;
+ SemaphoreSignal(HtmlReportLock);
+ AddContent(AResponse,'<pre>');
+ AddContent(AResponse,Report);
+ AddContent(AResponse,'</pre>');
  Result:=True;
 end;
 
@@ -347,10 +362,19 @@ begin
   begin
    AddByte($10);
    AddByte($00);
-   AddByte($03);
-   for I:=1 to Length(Part1) do
-    AddByte(Ord(Part1[I]));
-   AddByte($08);
+   if IpAddressAvailable then
+    begin
+     AddByte($02);
+     for I:=1 to Length(IpAddress) do
+      AddByte(Ord(IpAddress[I]));
+    end
+   else
+    begin
+     AddByte($03);
+     for I:=1 to Length(Part1) do
+      AddByte(Ord(Part1[I]));
+     AddByte($08);
+    end;
   end
  else
   begin
@@ -404,6 +428,10 @@ procedure EndOfScan;
 var 
  Now:LongWord;
  I:Integer;
+ Report:String;
+ Line:String;
+ Color:LongWord;
+ StyleColor:String;
 const 
  Limit = 70*1000*1000;
 procedure Cull;
@@ -436,19 +464,28 @@ begin
      break;
     end;
  ConsoleWindowSetXY(Console2,1,1);
+ Report:='';
  for I:=High(MessageTrackList) downto 0 do
   with MessageTrackList[I] do
    begin
     if Now - Last.TimeStamp > Limit - 15*1000*1000 then
-     ConsoleWindowSetForecolor(Console2,COLOR_RED)
+     Color:=COLOR_RED
     else if Now - Last.TimeStamp > Limit - 30*1000*1000 then
-          ConsoleWindowSetForecolor(Console2,COLOR_GRAY);
-    ConsoleWindowWrite(Console2,Format('%s %4d %s %s',[dBm(Last.Rssi),Count,Key,Last.Data]));
-    ConsoleWindowSetForecolor(Console2,COLOR_YELLOW);
+          Color:=COLOR_GRAY
+    else
+     Color:=COLOR_YELLOW;
+    Line:=Format('%s %4d %s %s',[dBm(Last.Rssi),Count,Key,Last.Data]);
+    ConsoleWindowSetForecolor(Console2,Color);
+    ConsoleWindowWrite(Console2,Line);
+    StyleColor:=(Color and $ffffff).ToHexString(6);
+    Report:=Report + '<div style=background-color:#' + StyleColor +';">' + Line + '</div>';
     ConsoleWindowClearEx(Console2,ConsoleWindowGetX(Console2),ConsoleWindowGetY(Console2),ConsoleWindowGetMaxX(Console2),ConsoleWindowGetY(Console2),False);
     ConsoleWindowWriteLn(Console2,'');
    end;
  ConsoleWindowClearEx(Console2,ConsoleWindowGetX(Console2),ConsoleWindowGetY(Console2),ConsoleWindowGetMaxX(Console2),ConsoleWindowGetMaxY(Console2),False);
+ SemaphoreWait(HtmlReportLock);
+ HtmlReport:=Report;
+ SemaphoreSignal(HtmlReportLock);
 end;
 
 function EventReadFirstByte:Byte;
@@ -747,6 +784,25 @@ begin
  Log('R - Restart - use bluetooth-dev-bluetoothtest-config.txt');
 end;
 
+function IpAddressLoop(Parameter:Pointer):PtrInt;
+var 
+ TCP : TWinsock2TCPClient;
+begin
+ Result:=0;
+ TCP:=TWinsock2TCPClient.Create;
+ IpAddress:=TCP.LocalAddress;
+ if (IpAddress = '') or (IpAddress = '0.0.0.0') or (IpAddress = '255.255.255.255') then
+  begin
+   while (IpAddress = '') or (IpAddress = '0.0.0.0') or (IpAddress = '255.255.255.255') do
+    begin
+     sleep(500);
+     IpAddress:=TCP.LocalAddress;
+    end;
+  end;
+ TCP.Free;
+ IpAddressAvailable:=True;
+end;
+
 function KeyboardLoop(Parameter:Pointer):PtrInt;
 begin
  Result:=0;
@@ -967,8 +1023,11 @@ begin
  Log('bluetooth-dev');
  RestoreBootFile('default','config.txt');
  StartLogging;
+ HtmlReportLock:=SemaphoreCreate(1);
+ IpAddressAvailable:=False;
  BeginThread(@KeyboardLoop,Nil,KeyboardLoopHandle,THREAD_STACK_DEFAULT_SIZE);
  BeginThread(@MonitorLoop,Nil,MonitorLoopHandle,THREAD_STACK_DEFAULT_SIZE);
+ BeginThread(@IpAddressLoop,Nil,IpAddressLoopHandle,THREAD_STACK_DEFAULT_SIZE);
  Help;
  WaitForSDDrive;
 
@@ -977,7 +1036,7 @@ begin
  HTTPListener.Active:=True;
  WEBSTATUS_FONT_NAME:='Monospace';
  WebStatusRegister(HTTPListener,'','',True);
- BluetoothWebStatus:=TBluetoothWebStatus.Create('Bluetooth','/bluetooth',2);
+ BluetoothWebStatus:=TBluetoothWebStatus.Create('Bluetooth','/bluetooth',1);
  HTTPListener.RegisterDocument('',BluetoothWebStatus);
 {$endif}
 
