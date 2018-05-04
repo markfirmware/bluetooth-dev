@@ -15,6 +15,7 @@ const
  ScanUnitsPerSecond          = 1600;
  ScanInterval                = 5.000;
  ScanWindow                  = 0.500;
+ RetentionLimit              = 70*1000*1000;
 
  HCI_COMMAND_PKT             = $01;
  HCI_EVENT_PKT               = $04;
@@ -432,45 +433,47 @@ var
  Line:String;
  Color:LongWord;
  StyleColor:String;
-const 
- Limit = 70*1000*1000;
 procedure Cull;
 var 
  NewList:Array of TMessageTrack;
- Track:TMessageTrack;
- I:Integer;
+ I,J:Integer;
+ AtLeastOneExpired:Boolean;
 begin
- SetLength(NewList,0);
+ AtLeastOneExpired:=False;
  for I:=0 to High(MessageTrackList) do
   begin
-   Track:=MessageTrackList[I];
-   if Now - Track.Last.TimeStamp <= Limit then
+   if LongWord(Now - MessageTrackList[I].Last.TimeStamp) > RetentionLimit then
     begin
-     SetLength(NewList,Length(NewList) + 1);
-     NewList[Length(NewList) - 1]:=Track;
-    end;
+     if not AtLeastOneExpired then
+      begin
+       AtLeastOneExpired:=True;
+       SetLength(NewList,I);
+       for J:=0 to I - 1 do
+        NewList[J]:=MessageTrackList[J];
+      end;
+    end
+   else if AtLeastOneExpired then
+         begin
+          SetLength(NewList,Length(NewList) + 1);
+          NewList[Length(NewList) - 1]:=MessageTrackList[I];
+         end;
   end;
- MessageTrackList:=NewList;
+ if AtLeastOneExpired then
+  MessageTrackList:=NewList;
 end;
 begin
  StopAdvertising;
  StartLeAdvertising;
  Now:=ClockGetCount;
- for I:=0 to High(MessageTrackList) do
-  with MessageTrackList[I] do
-   if Now - Last.TimeStamp > Limit then
-    begin
-     Cull;
-     break;
-    end;
+ Cull;
  ConsoleWindowSetXY(Console2,1,1);
  Report:='';
  for I:=High(MessageTrackList) downto 0 do
   with MessageTrackList[I] do
    begin
-    if Now - Last.TimeStamp > Limit - 15*1000*1000 then
+    if LongWord(Now - Last.TimeStamp) > RetentionLimit - 15*1000*1000 then
      Color:=COLOR_RED
-    else if Now - Last.TimeStamp > Limit - 30*1000*1000 then
+    else if LongWord(Now - Last.TimeStamp) > RetentionLimit - 30*1000*1000 then
           Color:=COLOR_GRAY
     else
      Color:=COLOR_YELLOW;
@@ -498,7 +501,7 @@ var
 begin
  Result:=0;
  EntryTime:=ClockGetCount;
- while ClockGetCount - EntryTime < 10*1000*1000 do
+ while LongWord(ClockGetCount - EntryTime) < 10*1000*1000 do
   begin
    Now:=ClockGetCount;
    c:=0;
@@ -511,17 +514,17 @@ begin
       begin
        ScanIdle:=False;
        StartTime:=Now;
-       if (ScanCycleCounter >= 1) and ((Now - EntryTime) div 1000 < Margin) then
+       if (ScanCycleCounter >= 1) and (LongWord(Now - EntryTime) div 1000 < Margin) then
         begin
-         Margin:=(Now - EntryTime) div 1000;
-         LoggingOutput(Format('lowest available processing time between scans is now %5.3fS',[Margin / 1000]));
+         Margin:=LongWord(Now - EntryTime) div 1000;
+         LoggingOutput(Format('lowest available processing time between scans is now %5.3fs',[Margin / 1000]));
         end;
       end;
      exit;
     end
    else
     begin
-     if (not ScanIdle) and (((Now - StartTime)/(1*1000*1000))  > (ScanWindow + 0.500))  then
+     if (not ScanIdle) and (LongWord(Now - StartTime)/(1*1000*1000)  > ScanWindow + 0.500)  then
       begin
        ScanIdle:=True;
        Inc(ScanCycleCounter);
@@ -543,7 +546,7 @@ var
 begin
  Result:=0;
  EntryTime:=ClockGetCount;
- while ClockGetCount - EntryTime < 1*1000*1000 do
+ while LongWord(ClockGetCount - EntryTime) < 1*1000*1000 do
   begin
    c:=0;
    res:=SerialDeviceRead(UART0,@b,1,SERIAL_READ_NON_BLOCK,c);
@@ -925,47 +928,44 @@ begin
    Event[I - 1]:=ReadByte;
    S:=S+Event[I - 1].ToHexString(2) + ' ';
   end;
- if EventLength <= 37 then
+ GetByteIndex:=4;
+ AddressString:='';
+ for I:=1 to 6 do
+  AddressString:=GetByte.ToHexString(2) + AddressString;
+ GetByteIndex:=18;
+ EddystoneLength:=GetByte;
+ AdType:=GetByte;
+ EddystoneLo:=GetByte;
+ EddystoneHi:=GetByte;
+ EddystoneType:=GetByte;
+ if (AdType = ADT_SERVICE_DATA) and (((EddystoneHi shl 8) or EddystoneLo) = EddystoneUuid) then
   begin
-   GetByteIndex:=4;
-   AddressString:='';
-   for I:=1 to 6 do
-    AddressString:=GetByte.ToHexString(2) + AddressString;
-   GetByteIndex:=18;
-   EddystoneLength:=GetByte;
-   AdType:=GetByte;
-   EddystoneLo:=GetByte;
-   EddystoneHi:=GetByte;
-   EddystoneType:=GetByte;
-   if (AdType = ADT_SERVICE_DATA) and (((EddystoneHi shl 8) or EddystoneLo) = EddystoneUuid) then
+   if EddystoneType = $10 then
     begin
-     if EddystoneType = $10 then
+     TransmitPower:=GetByte;
+     C:=GetByte;
+     S:=Scheme[C];
+     while GetByteIndex <= High(Event) - 1 do
       begin
-       TransmitPower:=GetByte;
        C:=GetByte;
-       S:=Scheme[C];
-       while GetByteIndex <= High(Event) - 1 do
-        begin
-         C:=GetByte;
-         if C <= High(Expansion) then
-          S:=S + Expansion[C]
-         else
-          S:=S + Char(C);
-        end;
-       Rssi:=GetByte;
-       Track(ClockGetCount,Rssi,Format('%s eddystone url %s tx %s',[AddressString,S,dBm(TransmitPower)]),'');
-      end
-     else if EddystoneType = $20 then
-           begin
-            TlmVersion:=GetByte;
-            TlmBattery:=GetWord;
-            TlmTemperature:=GetWord;
-            TlmAdvCount:=GetLongWord;
-            TlmSecCount:=GetLongWord;
-            Rssi:=GetByte;
-            Track(ClockGetCount,Rssi,Format('%s tlm',[AddressString]),Format('ver %d battery %5.3fV temp %d.%02.2dC adv %d time %4.1fS',[TlmVersion,TlmBattery*0.001,(TlmTemperature shr 8),TlmTemperature and $ff,TlmAdvCount,TlmSecCount*0.1]));
-           end;
-    end;
+       if C <= High(Expansion) then
+        S:=S + Expansion[C]
+       else
+        S:=S + Char(C);
+      end;
+     Rssi:=GetByte;
+     Track(ClockGetCount,Rssi,Format('%s tx %7s url %s',[AddressString,dBm(TransmitPower),S]),'');
+    end
+   else if EddystoneType = $20 then
+         begin
+          TlmVersion:=GetByte;
+          TlmBattery:=GetWord;
+          TlmTemperature:=GetWord;
+          TlmAdvCount:=GetLongWord;
+          TlmSecCount:=GetLongWord;
+          Rssi:=GetByte;
+          Track(ClockGetCount,Rssi,Format('%s tlm',[AddressString]),Format('battery %5.3fV temp %3d.%02.2dC adv %d time %3.1fs',[TlmBattery*0.001,(TlmTemperature shr 8),TlmTemperature and $ff,TlmAdvCount,TlmSecCount*0.1]));
+         end;
   end;
  // else
  //  Log(Format('message %02.2x %02.2x %d bytes',[EventType,EventSubtype,EventLength]));
@@ -979,7 +979,7 @@ var
  TimeStamp:LongWord;
 begin
  TimeStamp:=ClockGetCount;
- while ClockGetCount - TimeStamp < 1*1000*1000 do
+ while LongWord(ClockGetCount - TimeStamp) < 1*1000*1000 do
   begin
    Res:=SerialDeviceRead(UART0,@B,1,SERIAL_READ_NON_BLOCK,C);
    if (Res = ERROR_SUCCESS) and (C = 1) then
@@ -1023,6 +1023,7 @@ begin
  Log('bluetooth-dev');
  RestoreBootFile('default','config.txt');
  StartLogging;
+
  HtmlReportLock:=SemaphoreCreate(1);
  IpAddressAvailable:=False;
  BeginThread(@KeyboardLoop,Nil,KeyboardLoopHandle,THREAD_STACK_DEFAULT_SIZE);
