@@ -15,7 +15,7 @@ const
  ScanUnitsPerSecond          = 1600;
  ScanInterval                = 5.000;
  ScanWindow                  = 0.500;
- RetentionLimit              = 70*1000*1000;
+ RetentionLimit              = 90*1000*1000;
 
  HCI_COMMAND_PKT             = $01;
  HCI_EVENT_PKT               = $04;
@@ -34,18 +34,18 @@ const
  ADV_DIRECT_IND_LO           = $04; // Connectable low duty cycle directed advertising
 
  // Advertising Data Types
- ADT_FLAGS                   = $01;      // Flags
- ADT_INCOMPLETE_UUID16       = $02;      // Incomplete List of 16-bit Service Class UUIDs
- ADT_COMPLETE_UUID16         = $03;      // Complete List of 16-bit Service Class UUIDs
- ADT_INCOMPLETE_UUID32       = $04;      // Incomplete List of 32-bit Service Class UUIDs
- ADT_COMPLETE_UUID32         = $05;      // Complete List of 32-bit Service Class UUIDs
- ADT_INCOMPLETE_UUID128      = $06;      // Incomplete List of 128-bit Service Class UUIDs
- ADT_COMPLETE_UUDI128        = $07;      // Complete List of 128-bit Service Class UUIDs
- ADT_SHORTENED_LOCAL_NAME    = $08;      // Shortened Local name
- ADT_COMPLETE_LOCAL_NAME     = $09;      // Complete Local name
- ADT_POWER_LEVEL             = $0A;      // Tx Power Level
- ADT_DEVICE_CLASS            = $0D;      // Class of Device
- ADT_SERVICE_DATA            = $16;      // Service data, starts with service uuid followed by data
+ ADT_FLAGS                   = $01; // Flags
+ ADT_INCOMPLETE_UUID16       = $02; // Incomplete List of 16-bit Service Class UUIDs
+ ADT_COMPLETE_UUID16         = $03; // Complete List of 16-bit Service Class UUIDs
+ ADT_INCOMPLETE_UUID32       = $04; // Incomplete List of 32-bit Service Class UUIDs
+ ADT_COMPLETE_UUID32         = $05; // Complete List of 32-bit Service Class UUIDs
+ ADT_INCOMPLETE_UUID128      = $06; // Incomplete List of 128-bit Service Class UUIDs
+ ADT_COMPLETE_UUDI128        = $07; // Complete List of 128-bit Service Class UUIDs
+ ADT_SHORTENED_LOCAL_NAME    = $08; // Shortened Local name
+ ADT_COMPLETE_LOCAL_NAME     = $09; // Complete Local name
+ ADT_POWER_LEVEL             = $0A; // Tx Power Level
+ ADT_DEVICE_CLASS            = $0D; // Class of Device
+ ADT_SERVICE_DATA            = $16; // Service data, starts with service uuid followed by data
  ADT_MANUFACTURER_SPECIFIC   = $FF;
 
  ManufacturerTesting         = $ffff;
@@ -56,6 +56,7 @@ const
  BDADDR_LEN                  = 6;
 
 type 
+ TUuid = Array[0 .. 15] of Byte;
  TBDAddr = Array[0 .. BDADDR_LEN - 1] of Byte;
  TBluetoothWebStatus = class(TWebStatusCustom)
   function DoContent(AHost:THTTPHost;ARequest:THTTPServerRequest;AResponse:THTTPServerResponse):Boolean;override;
@@ -133,12 +134,15 @@ end;
 function TBluetoothWebStatus.DoContent(AHost:THTTPHost;ARequest:THTTPServerRequest;AResponse:THTTPServerResponse):Boolean;
 var 
  Report:String;
+ WorkTime:TDateTime;
 begin
  AddContent(AResponse,'<div><big><big><b>This page reloads every 5 seconds</b></big></big></div>');
  AddContent(AResponse,'<meta http-equiv="refresh" content="5">');
  AddContent(AResponse,'ExceptionRestartCounter ' + ExceptionRestartCounter.ToString);
  AddContent(AResponse,'ScanCycleCounter ' + ScanCycleCounter.ToString);
  AddContent(AResponse,'ReadByteCounter ' + ReadByteCounter.ToString);
+ WorkTime:=SystemFileTimeToDateTime(UpTime);
+ AddContent(AResponse,'Up ' + IntToStr(Trunc(WorkTime)) + ' days ' + TimeToStr(WorkTime));
  SemaphoreWait(HtmlReportLock);
  Report:=HtmlReport;
  SemaphoreSignal(HtmlReportLock);
@@ -419,9 +423,9 @@ var
  si:String;
 begin
  if Rssi = 127 then si := 'NU'
- else if Rssi > 128 then si := '-' + IntToStr (256 - Rssi) + ' dBm'
- else if Rssi <= 20 then si := '+' + IntToStr (Rssi) + ' dBm'
- else si := '? dBm';
+ else if Rssi > 128 then si := '-' + IntToStr (256 - Rssi) + 'dBm'
+ else if Rssi <= 20 then si := '+' + IntToStr (Rssi) + 'dBm'
+ else si := '?dBm';
  Result:=si;
 end;
 
@@ -477,7 +481,7 @@ begin
           Color:=COLOR_GRAY
     else
      Color:=COLOR_YELLOW;
-    Line:=Format('%s %4d %s %s',[dBm(Last.Rssi),Count,Key,Last.Data]);
+    Line:=Format('%7s %4d %s %s',[dBm(Last.Rssi),Count,Key,Last.Data]);
     ConsoleWindowSetForecolor(Console2,Color);
     ConsoleWindowWrite(Console2,Line);
     StyleColor:=(Color and $ffffff).ToHexString(6);
@@ -887,6 +891,18 @@ begin
  MessageTrackList[0]:=MessageTrack;
 end;
 
+function AsWord(H,L:Byte):Word;
+begin
+ Result:=(H shl 8) or L;
+end;
+
+function UuidToStr (uuid : TUuid) : string;
+begin
+ Result := format ('%.2X%.2X%.2X%.2X-%.2X%.2X-%.2X%.2X-%.2X%.2X-%.2X%.2X%.2X%.2X%.2X%.2X',
+          [uuid[0], uuid[1], uuid[2], uuid[3], uuid[4], uuid[5], uuid[6], uuid[7],
+          uuid[8], uuid[9], uuid[10], uuid[11], uuid[12], uuid[13], uuid[14], uuid[15]])
+end;
+
 procedure ParseEvent;
 var 
  I:Integer;
@@ -901,6 +917,10 @@ var
  S:String;
  GetByteIndex:Integer;
  AddressString:String;
+ MainType,MfrLo,MfrHi:Byte;
+ Byte02,Byte15:Byte;
+ Uuid:TUuid;
+ MajorLo,MajorHi,MinorLo,MinorHi:Byte;
 function GetByte:Byte;
 begin
  Result:=Event[GetByteIndex];
@@ -932,43 +952,62 @@ begin
  AddressString:='';
  for I:=1 to 6 do
   AddressString:=GetByte.ToHexString(2) + AddressString;
+ GetByteIndex:=15;
+ MainType:=GetByte;
+ MfrLo:=GetByte;
+ MfrHi:=GetByte;
+ Byte02:=GetByte;
+ Byte15:=GetByte;
  GetByteIndex:=18;
  EddystoneLength:=GetByte;
  AdType:=GetByte;
  EddystoneLo:=GetByte;
  EddystoneHi:=GetByte;
  EddystoneType:=GetByte;
- if (AdType = ADT_SERVICE_DATA) and (((EddystoneHi shl 8) or EddystoneLo) = EddystoneUuid) then
+ if (MainType = $ff) and (((MfrHi shl 8) or MfrLo) = ManufacturerApple) and (Byte02 = $02) and (Byte15 = $15) then
   begin
-   if EddystoneType = $10 then
-    begin
-     TransmitPower:=GetByte;
-     C:=GetByte;
-     S:=Scheme[C];
-     while GetByteIndex <= High(Event) - 1 do
-      begin
-       C:=GetByte;
-       if C <= High(Expansion) then
-        S:=S + Expansion[C]
-       else
-        S:=S + Char(C);
-      end;
-     Rssi:=GetByte;
-     Track(ClockGetCount,Rssi,Format('%s tx %7s url %s',[AddressString,dBm(TransmitPower),S]),'');
-    end
-   else if EddystoneType = $20 then
+   GetByteIndex:=20;
+   for I:=Low(Uuid) to High(Uuid) do
+    Uuid[I]:=GetByte;
+   MajorHi:=GetByte;
+   MajorLo:=GetByte;
+   MinorHi:=GetByte;
+   MinorLo:=GetByte;
+   TransmitPower:=GetByte;
+   Rssi:=GetByte;
+   Track(ClockGetCount,Rssi,Format('%s ibc %7stx %s mjr %d mnr %d',[AddressString,dBm(TransmitPower),UuidToStr(Uuid),AsWord(MajorHi,MajorLo),AsWord(MinorHi,MinorLo)]),'');
+  end
+ else if (AdType = ADT_SERVICE_DATA) and (((EddystoneHi shl 8) or EddystoneLo) = EddystoneUuid) then
+       begin
+        if EddystoneType = $10 then
          begin
-          TlmVersion:=GetByte;
-          TlmBattery:=GetWord;
-          TlmTemperature:=GetWord;
-          TlmAdvCount:=GetLongWord;
-          TlmSecCount:=GetLongWord;
+          TransmitPower:=GetByte;
+          C:=GetByte;
+          S:=Scheme[C];
+          while GetByteIndex <= High(Event) - 1 do
+           begin
+            C:=GetByte;
+            if C <= High(Expansion) then
+             S:=S + Expansion[C]
+            else
+             S:=S + Char(C);
+           end;
           Rssi:=GetByte;
-          Track(ClockGetCount,Rssi,Format('%s tlm',[AddressString]),Format('battery %5.3fV temp %3d.%02.2dC adv %d time %3.1fs',[TlmBattery*0.001,(TlmTemperature shr 8),TlmTemperature and $ff,TlmAdvCount,TlmSecCount*0.1]));
-         end;
-  end;
+          Track(ClockGetCount,Rssi,Format('%s url %7stx %s',[AddressString,dBm(TransmitPower),S]),'');
+         end
+        else if EddystoneType = $20 then
+              begin
+               TlmVersion:=GetByte;
+               TlmBattery:=GetWord;
+               TlmTemperature:=GetWord;
+               TlmAdvCount:=GetLongWord;
+               TlmSecCount:=GetLongWord;
+               Rssi:=GetByte;
+               Track(ClockGetCount,Rssi,Format('%s tlm',[AddressString]),Format('battery %5.3fV temp %3d.%02.2dC adv %d time %3.1fs',[TlmBattery*0.001,(TlmTemperature shr 8),TlmTemperature and $ff,TlmAdvCount,TlmSecCount*0.1]));
+              end;
+       end;
  // else
- //  Log(Format('message %02.2x %02.2x %d bytes',[EventType,EventSubtype,EventLength]));
+ //   Log(Format('message %02.2x %02.2x %d bytes %s',[EventType,EventSubtype,EventLength,S]));
 end;
 
 procedure FlushRx;
