@@ -342,6 +342,7 @@ var
  I:Integer;
  UpTime:Int64;
  Temperature:Double;
+ Message:String;
 const 
  Part1 = 'ultibo';
 procedure AddByte(X:Byte);
@@ -360,42 +361,57 @@ begin
  AddWord(Lo(X));
 end;
 begin
+ ClearAdvertisingData;
  SetLength(EddystoneServiceData,0);
- AddByte(Lo(EddystoneUuid));
- AddByte(Hi(EddystoneUuid));
  if (ScanCycleCounter mod 6) = 0 then
   begin
-   AddByte($10);
-   AddByte($00);
-   if IpAddressAvailable then
-    begin
-     AddByte($02);
-     for I:=1 to Length(IpAddress) do
-      AddByte(Ord(IpAddress[I]));
-    end
-   else
-    begin
-     AddByte($03);
-     for I:=1 to Length(Part1) do
-      AddByte(Ord(Part1[I]));
-     AddByte($08);
-    end;
+   Message:=Format('up %4.2fs',[ClockGetTotal / (1000*1000)]);
+   AddByte($ff);
+   AddByte($ff);
+   AddByte($55);
+   AddByte($4c);
+   AddByte(34);
+   for I:=Low(Message) to High(Message) do
+    AddByte(Ord(Message[I]));
+   AddAdvertisingData(ADT_MANUFACTURER_SPECIFIC,EddystoneServiceData);
   end
  else
   begin
-   UpTime:=ClockGetTotal;
-   Temperature:=TemperatureGetCurrent(TEMPERATURE_ID_SOC) / 1000;
-   AddByte($20);
-   AddByte($00);
-   AddWord(4993);
-   AddWord((Trunc(Temperature) shl 8) or Round((Temperature - Trunc(Temperature))*100));
-   AddLongWord(UpTime div (1*1000*1000));
-   AddLongWord(UpTime div (100*1000));
+   AddByte(Lo(EddystoneUuid));
+   AddByte(Hi(EddystoneUuid));
+   if (ScanCycleCounter mod 6) = 1 then
+    begin
+     AddByte($10);
+     AddByte($00);
+     if IpAddressAvailable then
+      begin
+       AddByte($02);
+       for I:=1 to Length(IpAddress) do
+        AddByte(Ord(IpAddress[I]));
+      end
+     else
+      begin
+       AddByte($03);
+       for I:=1 to Length(Part1) do
+        AddByte(Ord(Part1[I]));
+       AddByte($08);
+      end;
+    end
+   else
+    begin
+     UpTime:=ClockGetTotal;
+     Temperature:=TemperatureGetCurrent(TEMPERATURE_ID_SOC) / 1000;
+     AddByte($20);
+     AddByte($00);
+     AddWord(4993);
+     AddWord((Trunc(Temperature) shl 8) or Round((Temperature - Trunc(Temperature))*100));
+     AddLongWord(UpTime div (1*1000*1000));
+     AddLongWord(UpTime div (100*1000));
+    end;
+   AddAdvertisingData(ADT_FLAGS,[$18]);
+   AddAdvertisingData(ADT_COMPLETE_UUID16,[Lo(EddystoneUuid),Hi(EddystoneUuid)]);
+   AddAdvertisingData(ADT_SERVICE_DATA,EddystoneServiceData);
   end;
- ClearAdvertisingData;
- AddAdvertisingData(ADT_FLAGS,[$18]);
- AddAdvertisingData(ADT_COMPLETE_UUID16,[Lo(EddystoneUuid),Hi(EddystoneUuid)]);
- AddAdvertisingData(ADT_SERVICE_DATA,EddystoneServiceData);
  SetLEAdvertisingData(AdData);
 end;
 
@@ -784,11 +800,17 @@ end;
 
 procedure Help;
 begin
+ Log('');
  Log('H - Help - display this help message');
  Log('L - Loop - restart the broadcast/observe loop');
  Log('D - Drop Byte - drop one byte from the uart rx');
  Log('Q - Quit - use default-config.txt');
  Log('R - Restart - use bluetooth-dev-bluetoothtest-config.txt');
+ Log('');
+ Log('Legend');
+ Log('R/P/? Random/Public/Other MAC Address');
+ Log('C/D/S/N/R Connectable/Directed/Scannable/Non-connectable/Response Ad Event Type');
+ Log('');
 end;
 
 function IpAddressLoop(Parameter:Pointer):PtrInt;
@@ -831,6 +853,29 @@ begin
   end;
 end;
 
+function MacAddressTypeToStr(MacAddressType:Byte):String;
+begin
+ case MacAddressType of 
+  $00:Result:='P';
+  $01:Result:='R';
+  else
+   Result:='?';
+ end;
+end;
+
+function AdEventTypeToStr(AdEventType:Byte):String;
+begin
+ case AdEventType of 
+  $00:Result:='C';
+  $01:Result:='D';
+  $02:Result:='S';
+  $03:Result:='N';
+  $04:Result:='R';
+  else
+   Result:='?';
+ end;
+end;
+
 function AdvertisingTypeToStr(Type_:byte):string;
 begin
  case Type_ of 
@@ -840,6 +885,17 @@ begin
   ADV_NONCONN_IND   : Result:='non-connectable undirected advertising';
   ADV_DIRECT_IND_LO : Result:='connectable low duty cycle directed advertising';
   else                Result:='reserved for future use (' + Type_.ToHexString(2) + ')';
+ end;
+end;
+
+function ManufacturerToString(Mfr:Word):String;
+begin
+ case Mfr of 
+  ManufacturerTesting:Result:='Testing';
+  ManufacturerApple:Result:='Apple';
+  ManufacturerMicrosoft:Result:='Microsoft';
+  else
+   Result:='Mfr?';
  end;
 end;
 
@@ -907,7 +963,9 @@ procedure ParseEvent;
 var 
  I:Integer;
  EventType,EventSubtype,EventLength:Byte;
- EddystoneLength,AdType,EddystoneLo,EddystoneHi,EddystoneType,TransmitPower,Rssi,C:Byte;
+ EddystoneLength,AdType,EddystoneLo,EddystoneHi,EddystoneType,TransmitPower,Rssi,C,AdEventType,AddressType:Byte;
+ MainLength,FlagsLength,FlagsType,Flags:Byte;
+ SignatureLo,SignatureHi,Channel:Byte;
  TlmVersion:Byte;
  TlmBattery:Word;
  TlmTemperature:Word;
@@ -921,6 +979,11 @@ var
  Byte02,Byte15:Byte;
  Uuid:TUuid;
  MajorLo,MajorHi,MinorLo,MinorHi:Byte;
+ NameSpace:Array[0 .. 9] of Byte;
+ Instance:Array[0 .. 5] of Byte;
+ EphemeralId:Array[0 .. 7] of Byte;
+ AltBeaconData:Array[0 .. 19] of Byte;
+ AltBeaconReserved:Byte;
 function GetByte:Byte;
 begin
  Result:=Event[GetByteIndex];
@@ -942,17 +1005,30 @@ begin
  EventLength:=ReadByte;
  SetLength(Event,0);
  S:='';
- for I:=1 to EventLength do
+ for I:=1 to EventLength - 1 do
   begin
    SetLength(Event,Length(Event) + 1);
    Event[I - 1]:=ReadByte;
-   S:=S+Event[I - 1].ToHexString(2) + ' ';
+   if I > 10 then
+    begin
+     S:=S + Event[I - 1].ToHexString(2);
+     if ((I + 2) mod 4) = 0 then
+      S:=S + ' ';
+    end;
   end;
- GetByteIndex:=4;
+ Rssi:=ReadByte;
+ GetByteIndex:=2;
+ AdEventType:=GetByte;
+ AddressType:=GetByte;
  AddressString:='';
  for I:=1 to 6 do
   AddressString:=GetByte.ToHexString(2) + AddressString;
- GetByteIndex:=15;
+ AddressString:=AddressString + MacAddressTypeToStr(AddressType) + AdEventTypeToStr(AdEventType);
+ GetByteIndex:=11;
+ FlagsLength:=GetByte;
+ FlagsType:=GetByte;
+ Flags:=GetByte;
+ MainLength:=GetByte;
  MainType:=GetByte;
  MfrLo:=GetByte;
  MfrHi:=GetByte;
@@ -964,37 +1040,109 @@ begin
  EddystoneLo:=GetByte;
  EddystoneHi:=GetByte;
  EddystoneType:=GetByte;
- if (MainType = $ff) and (((MfrHi shl 8) or MfrLo) = ManufacturerApple) and (Byte02 = $02) and (Byte15 = $15) then
+ if FlagsType= $ff then
   begin
-   GetByteIndex:=20;
-   for I:=Low(Uuid) to High(Uuid) do
-    Uuid[I]:=GetByte;
-   MajorHi:=GetByte;
-   MajorLo:=GetByte;
-   MinorHi:=GetByte;
-   MinorLo:=GetByte;
-   TransmitPower:=GetByte;
-   Rssi:=GetByte;
-   Track(ClockGetCount,Rssi,Format('%s ibc %7stx %s mjr %d mnr %d',[AddressString,dBm(TransmitPower),UuidToStr(Uuid),AsWord(MajorHi,MajorLo),AsWord(MinorHi,MinorLo)]),'');
+   GetByteIndex:=13;
+   MfrLo:=GetByte;
+   MfrHi:=GetByte;
+   SignatureLo:=GetByte;
+   SignatureHi:=Getbyte;
+   if (AsWord(MfrHi,MfrLo) = Word(ManufacturerTesting)) and (SignatureLo = $55) and (SignatureHi = $4c) then
+    begin
+     Channel:=GetByte;
+     S:='';
+     while GetByteIndex <= High(Event) do
+      begin
+       S:=S + Char(GetByte);
+      end;
+     Track(ClockGetCount,Rssi,Format('%s ult chan %d %s',[AddressString,Channel,S]),'');
+    end
+   else
+    begin
+     S:='';
+     GetByteIndex:=15;
+     while GetByteIndex <= High(Event) do
+      begin
+       S:=S + GetByte.ToHexString(2);
+       if (GetByteIndex mod 4) = 3 then
+        S:=S + ' ';
+      end;
+     Track(ClockGetCount,Rssi,Format('%s mfr %s %s',[AddressString,ManufacturerToString(AsWord(MfrHi,MfrLo)),S]),'');
+    end;
   end
+ else if (MainType = $ff) and (((MfrHi shl 8) or MfrLo) = ManufacturerApple) and (Byte02 = $02) and (Byte15 = $15) then
+       begin
+        GetByteIndex:=20;
+        for I:=Low(Uuid) to High(Uuid) do
+         Uuid[I]:=GetByte;
+        MajorHi:=GetByte;
+        MajorLo:=GetByte;
+        MinorHi:=GetByte;
+        MinorLo:=GetByte;
+        TransmitPower:=GetByte;
+        Track(ClockGetCount,Rssi,Format('%s ibn %7stx %s mjr %d mnr %d',[AddressString,dBm(TransmitPower),UuidToStr(Uuid),AsWord(MajorHi,MajorLo),AsWord(MinorHi,MinorLo)]),'');
+       end
+ else if (MainType = $ff) and (((MfrHi shl 8) or MfrLo) = ManufacturerTesting) and (Byte02 = $BE) and (Byte15 = $AC) then
+       begin
+        GetByteIndex:=20;
+        S:='';
+        for I:=0 to High(AltBeaconData) do
+         begin
+          AltBeaconData[I]:=GetByte;
+          S:=S + AltBeaconData[I].ToHexString(2);
+          if (I mod 4) = 3 then
+           S:=S + ' ';
+         end;
+        TransmitPower:=GetByte;
+        AltBeaconReserved:=GetByte;
+        Track(ClockGetCount,Rssi,Format('%s abn %7stx id %s reserved %02.2x',[AddressString,dBm(TransmitPower),S,AltBeaconReserved]),'');
+       end
+ else if (MainType = $ff) then
+       begin
+        S:='';
+        GetByteIndex:=18;
+        while GetByteIndex <= High(Event) do
+         begin
+          S:=S + GetByte.ToHexString(2);
+          if (GetByteIndex mod 4) = 2 then
+           S:=S + ' ';
+         end;
+        Track(ClockGetCount,Rssi,Format('%s mfr %s %s',[AddressString,ManufacturerToString(AsWord(MfrHi,MfrLo)),S]),'');
+       end
  else if (AdType = ADT_SERVICE_DATA) and (((EddystoneHi shl 8) or EddystoneLo) = EddystoneUuid) then
        begin
-        if EddystoneType = $10 then
+        if EddystoneType = $00 then
          begin
           TransmitPower:=GetByte;
-          C:=GetByte;
-          S:=Scheme[C];
-          while GetByteIndex <= High(Event) - 1 do
+          S:='namespace ';
+          for I:=0 to High(NameSpace) do
            begin
-            C:=GetByte;
-            if C <= High(Expansion) then
-             S:=S + Expansion[C]
-            else
-             S:=S + Char(C);
+            NameSpace[I]:=GetByte;
+            S:=S + NameSpace[I].ToHexString(2);
            end;
-          Rssi:=GetByte;
-          Track(ClockGetCount,Rssi,Format('%s url %7stx %s',[AddressString,dBm(TransmitPower),S]),'');
+          S:=S + ' instance ';
+          for I:=0 to High(Instance) do
+           begin
+            Instance[I]:=GetByte;
+            S:=S + Instance[I].ToHexString(2);
+           end;
+          Track(ClockGetCount,Rssi,Format('%s uid %7stx %s',[AddressString,dBm(TransmitPower),S]),'');
          end
+        else if EddystoneType = $10 then
+              begin
+               TransmitPower:=GetByte;
+               C:=GetByte;
+               S:=Scheme[C];
+               while GetByteIndex <= High(Event) do
+                begin
+                 C:=GetByte;
+                 if C <= High(Expansion) then
+                  S:=S + Expansion[C]
+                 else
+                  S:=S + Char(C);
+                end;
+               Track(ClockGetCount,Rssi,Format('%s url %7stx %s',[AddressString,dBm(TransmitPower),S]),'');
+              end
         else if EddystoneType = $20 then
               begin
                TlmVersion:=GetByte;
@@ -1002,12 +1150,27 @@ begin
                TlmTemperature:=GetWord;
                TlmAdvCount:=GetLongWord;
                TlmSecCount:=GetLongWord;
-               Rssi:=GetByte;
                Track(ClockGetCount,Rssi,Format('%s tlm',[AddressString]),Format('battery %5.3fV temp %3d.%02.2dC adv %d time %3.1fs',[TlmBattery*0.001,(TlmTemperature shr 8),TlmTemperature and $ff,TlmAdvCount,TlmSecCount*0.1]));
-              end;
-       end;
- // else
- //   Log(Format('message %02.2x %02.2x %d bytes %s',[EventType,EventSubtype,EventLength,S]));
+              end
+        else if EddystoneType = $30 then
+              begin
+               TransmitPower:=GetByte;
+               S:='';
+               for I:=0 to High(EphemeralId) do
+                begin
+                 EphemeralId[I]:=GetByte;
+                 S:=S + NameSpace[I].ToHexString(2);
+                end;
+               Track(ClockGetCount,Rssi,Format('%s eid %7stx %s',[AddressString,dBm(TransmitPower),S]),'');
+              end
+        else
+         Track(ClockGetCount,Rssi,Format('%s hex %s',[AddressString,S]),'');
+       end
+ else
+  begin
+   //   Log(Format('message %02.2x %02.2x %d bytes %s',[EventType,EventSubtype,EventLength,S]));
+   Track(ClockGetCount,Rssi,Format('%s hex %s',[AddressString,S]),'');
+  end;
 end;
 
 procedure FlushRx;
