@@ -336,6 +336,20 @@ begin
  HciCommand(OGF_LE_CONTROL,$08,Params);
 end;
 
+procedure SetLEScanResponseData(Data:array of byte);
+var 
+ Params:array of byte;
+ Len:byte;
+ i:integer;
+begin
+ Len:=Min(Length(Data),31);
+ SetLength(Params,Len + 1);
+ Params[0]:=Len;
+ for i:=0 to Len - 1 do
+  Params[i + 1]:=Data[i];
+ HciCommand(OGF_LE_CONTROL,$09,Params);
+end;
+
 procedure UpdateBeacon;
 var 
  EddystoneServiceData:Array of Byte;
@@ -413,6 +427,18 @@ begin
    AddAdvertisingData(ADT_SERVICE_DATA,EddystoneServiceData);
   end;
  SetLEAdvertisingData(AdData);
+ ClearAdvertisingData;
+ SetLength(EddyStoneServiceData,0);
+ Message:=Format('no09 mile %4.1f',[(ClockGetTotal / (1000*1000)) / 500 + 45]);
+ AddByte($ff);
+ AddByte($ff);
+ AddByte($55);
+ AddByte($4c);
+ AddByte(18);
+ for I:=Low(Message) to High(Message) do
+  AddByte(Ord(Message[I]));
+ AddAdvertisingData(ADT_MANUFACTURER_SPECIFIC,EddystoneServiceData);
+ SetLEScanResponseData(AdData);
 end;
 
 procedure SetLEAdvertisingParameters(MinInterval,MaxInterval:Word; Type_:byte; OwnAddressType,PeerAddressType:byte; PeerAddr:TBDAddr; ChannelMap,FilterPolicy:byte);
@@ -429,7 +455,7 @@ procedure StartLeAdvertising;
 var 
  ZeroAddress:TBDAddr = ($00,$00,$00,$00,$00,$00);
 begin
- SetLEAdvertisingParameters(1000,1000,ADV_IND,$00,$00,ZeroAddress,$07,$00);
+ SetLEAdvertisingParameters(1000,1000,ADV_SCAN_IND,$00,$00,ZeroAddress,$07,$00);
  UpdateBeacon;
  StartUndirectedAdvertising;
 end;
@@ -719,6 +745,7 @@ end;
 procedure StartLogging;
 begin
  LOGGING_INCLUDE_COUNTER:=False;
+ LOGGING_INCLUDE_TICKCOUNT:=True;
  CONSOLE_REGISTER_LOGGING:=True;
  CONSOLE_LOGGING_POSITION:=CONSOLE_POSITION_BOTTOMRIGHT;
  LoggingConsoleDeviceAdd(ConsoleDeviceGetDefault);
@@ -749,6 +776,12 @@ end;
 procedure StartPassiveScanning;
 begin
  SetLEScanParameters(LL_SCAN_PASSIVE,Round(ScanInterval*ScanUnitsPerSecond),Round(ScanWindow*ScanUnitsPerSecond),$00,$00);
+ SetLEScanEnable(True,False);
+end;
+
+procedure StartActiveScanning;
+begin
+ SetLEScanParameters(LL_SCAN_ACTIVE,Round(ScanInterval*ScanUnitsPerSecond),Round(ScanWindow*ScanUnitsPerSecond),$00,$00);
  SetLEScanEnable(True,False);
 end;
 
@@ -964,7 +997,7 @@ var
  I:Integer;
  EventType,EventSubtype,EventLength:Byte;
  EddystoneLength,AdType,EddystoneLo,EddystoneHi,EddystoneType,TransmitPower,Rssi,C,AdEventType,AddressType:Byte;
- MainLength,FlagsLength,FlagsType,Flags:Byte;
+ DataLength,MainLength,FlagsLength,FlagsType,Flags:Byte;
  SignatureLo,SignatureHi,Channel:Byte;
  TlmVersion:Byte;
  TlmBattery:Word;
@@ -1009,13 +1042,15 @@ begin
   begin
    SetLength(Event,Length(Event) + 1);
    Event[I - 1]:=ReadByte;
-   if I > 10 then
+   if I > 11 then
     begin
      S:=S + Event[I - 1].ToHexString(2);
      if ((I + 2) mod 4) = 0 then
       S:=S + ' ';
     end;
   end;
+ if S = '' then
+  S:='(no data)';
  Rssi:=ReadByte;
  GetByteIndex:=2;
  AdEventType:=GetByte;
@@ -1024,7 +1059,7 @@ begin
  for I:=1 to 6 do
   AddressString:=GetByte.ToHexString(2) + AddressString;
  AddressString:=AddressString + MacAddressTypeToStr(AddressType) + AdEventTypeToStr(AdEventType);
- GetByteIndex:=11;
+ DataLength:=GetByte;
  FlagsLength:=GetByte;
  FlagsType:=GetByte;
  Flags:=GetByte;
@@ -1164,11 +1199,14 @@ begin
                Track(ClockGetCount,Rssi,Format('%s eid %7stx %s',[AddressString,dBm(TransmitPower),S]),'');
               end
         else
-         Track(ClockGetCount,Rssi,Format('%s hex %s',[AddressString,S]),'');
+         begin
+          Track(ClockGetCount,Rssi,Format('%s hex %s',[AddressString,S]),'');
+          Log(Format('%s hex %s',[AddressString,S]));
+         end;
        end
  else
   begin
-   //   Log(Format('message %02.2x %02.2x %d bytes %s',[EventType,EventSubtype,EventLength,S]));
+   Log(Format('message %02.2x %02.2x %d bytes %s',[EventType,EventSubtype,EventLength,S]));
    Track(ClockGetCount,Rssi,Format('%s hex %s',[AddressString,S]),'');
   end;
 end;
@@ -1263,7 +1301,7 @@ begin
       StartLeAdvertising;
       Margin:=High(Margin);
       SetLength(MessageTrackList,0);
-      StartPassiveScanning;
+      StartActiveScanning;
       Log('Receiving scan data');
       ScanIdle:=True;
       while not RestartBroadcastObserveLoop do
