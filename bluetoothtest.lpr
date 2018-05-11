@@ -998,7 +998,6 @@ var
  EventType,EventSubtype,EventLength:Byte;
  EddystoneLength,AdType,EddystoneLo,EddystoneHi,EddystoneType,TransmitPower,Rssi,C,AdEventType,AddressType:Byte;
  DataLength,MainLength,FlagsLength,FlagsType,Flags:Byte;
- SignatureLo,SignatureHi,Channel:Byte;
  TlmVersion:Byte;
  TlmBattery:Word;
  TlmTemperature:Word;
@@ -1009,7 +1008,7 @@ var
  GetByteIndex:Integer;
  AddressString:String;
  MainType,MfrLo,MfrHi:Byte;
- Byte02,Byte15:Byte;
+ MfrType,MfrLength,MfrFirst,MfrSecond:Byte;
  Uuid:TUuid;
  MajorLo,MajorHi,MinorLo,MinorHi:Byte;
  NameSpace:Array[0 .. 9] of Byte;
@@ -1017,6 +1016,7 @@ var
  EphemeralId:Array[0 .. 7] of Byte;
  AltBeaconData:Array[0 .. 19] of Byte;
  AltBeaconReserved:Byte;
+ AppleTvVarying:Byte;
 function GetByte:Byte;
 begin
  Result:=Event[GetByteIndex];
@@ -1049,9 +1049,12 @@ begin
       S:=S + ' ';
     end;
   end;
- if S = '' then
-  S:='(no data)';
  Rssi:=ReadByte;
+ if S = '' then
+  begin
+   S:='(no data)';
+   exit;
+  end;
  GetByteIndex:=2;
  AdEventType:=GetByte;
  AddressType:=GetByte;
@@ -1067,31 +1070,45 @@ begin
  MainType:=GetByte;
  MfrLo:=GetByte;
  MfrHi:=GetByte;
- Byte02:=GetByte;
- Byte15:=GetByte;
+ MfrType:=GetByte;
+ MfrLength:=GetByte;
+ MfrFirst:=GetByte;
+ MfrSecond:=GetByte;
  GetByteIndex:=18;
  EddystoneLength:=GetByte;
  AdType:=GetByte;
  EddystoneLo:=GetByte;
  EddystoneHi:=GetByte;
  EddystoneType:=GetByte;
- if FlagsType= $ff then
+ if FlagsType = $ff then
   begin
    GetByteIndex:=13;
    MfrLo:=GetByte;
    MfrHi:=GetByte;
-   SignatureLo:=GetByte;
-   SignatureHi:=Getbyte;
-   if (AsWord(MfrHi,MfrLo) = Word(ManufacturerTesting)) and (SignatureLo = $55) and (SignatureHi = $4c) then
+   MfrType:=GetByte;
+   MfrLength:=GetByte;
+   MfrFirst:=GetByte;
+   MfrSecond:=GetByte;
+   if (AsWord(MfrHi,MfrLo) = Word(ManufacturerTesting)) and (MfrType = $55) and (MfrLength = $4c) then
     begin
-     Channel:=GetByte;
-     S:='';
+     S:=Char(MfrSecond);
      while GetByteIndex <= High(Event) do
       begin
        S:=S + Char(GetByte);
       end;
-     Track(ClockGetCount,Rssi,Format('%s ult chan %d %s',[AddressString,Channel,S]),'');
+     Track(ClockGetCount,Rssi,Format('%s ult chan %d',[AddressString,MfrFirst]),S);
     end
+   else if (((MfrHi shl 8) or MfrLo) = ManufacturerMicrosoft) and (MfrType = $01) and (MfrLength = $09) and (MfrFirst = $20) and (MfrSecond = $00) then
+         begin
+          S:='salt ';
+          GetByteIndex:=19;
+          while GetByteIndex <= 22 do
+           S:=S + GetByte.ToHexString(2);
+          S:=S + ' hash ';
+          while GetByteIndex <= High(Event) do
+           S:=S + GetByte.ToHexString(2);
+          Track(ClockGetCount,Rssi,Format('%s mfr win10 %s',[AddressString,S]),'');
+         end
    else
     begin
      S:='';
@@ -1105,19 +1122,37 @@ begin
      Track(ClockGetCount,Rssi,Format('%s mfr %s %s',[AddressString,ManufacturerToString(AsWord(MfrHi,MfrLo)),S]),'');
     end;
   end
- else if (MainType = $ff) and (((MfrHi shl 8) or MfrLo) = ManufacturerApple) and (Byte02 = $02) and (Byte15 = $15) then
+ else if (MainType = $ff) and (((MfrHi shl 8) or MfrLo) = ManufacturerApple) then
        begin
-        GetByteIndex:=20;
-        for I:=Low(Uuid) to High(Uuid) do
-         Uuid[I]:=GetByte;
-        MajorHi:=GetByte;
-        MajorLo:=GetByte;
-        MinorHi:=GetByte;
-        MinorLo:=GetByte;
-        TransmitPower:=GetByte;
-        Track(ClockGetCount,Rssi,Format('%s ibn %7stx %s mjr %d mnr %d',[AddressString,dBm(TransmitPower),UuidToStr(Uuid),AsWord(MajorHi,MajorLo),AsWord(MinorHi,MinorLo)]),'');
+        if (MfrType = $02) and (MfrLength = $15) then
+         begin
+          GetByteIndex:=20;
+          for I:=Low(Uuid) to High(Uuid) do
+           Uuid[I]:=GetByte;
+          MajorHi:=GetByte;
+          MajorLo:=GetByte;
+          MinorHi:=GetByte;
+          MinorLo:=GetByte;
+          TransmitPower:=GetByte;
+          Track(ClockGetCount,Rssi,Format('%s ibn %7stx %s mjr %d mnr %d',[AddressString,dBm(TransmitPower),UuidToStr(Uuid),AsWord(MajorHi,MajorLo),AsWord(MinorHi,MinorLo)]),'');
+         end
+        else if (MfrType = $09) and (MfrLength = $06) and (MfrFirst = $03) then
+              begin
+               GetByteIndex:=21;
+               AppleTvVarying:=GetByte;
+               S:='';
+               for I:=0 to 3 do
+                begin
+                 S:=S + GetByte.ToHexString(2);
+                end;
+               Track(ClockGetCount,Rssi,Format('%s mfr AppleTV %s',[AddressString,S]),AppleTvVarying.ToHexString(2));
+              end
+        else
+         begin
+          Track(ClockGetCount,Rssi,Format('%s mfr %s %s',[AddressString,ManufacturerToString(AsWord(MfrHi,MfrLo)),S]),'');
+         end
        end
- else if (MainType = $ff) and (((MfrHi shl 8) or MfrLo) = ManufacturerTesting) and (Byte02 = $BE) and (Byte15 = $AC) then
+ else if (MainType = $ff) and (((MfrHi shl 8) or MfrLo) = ManufacturerTesting) and (MfrType = $BE) and (MfrLength = $AC) then
        begin
         GetByteIndex:=20;
         S:='';
@@ -1206,7 +1241,7 @@ begin
        end
  else
   begin
-   Log(Format('message %02.2x %02.2x %d bytes %s',[EventType,EventSubtype,EventLength,S]));
+   // Log(Format('message %02.2x %02.2x %d bytes %s',[EventType,EventSubtype,EventLength,S]));
    Track(ClockGetCount,Rssi,Format('%s hex %s',[AddressString,S]),'');
   end;
 end;
