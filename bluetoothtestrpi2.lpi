@@ -33,7 +33,7 @@
     </RunParams>
     <Units Count="1">
       <Unit0>
-        <Filename Value="rpi2.lpr"/>
+        <Filename Value="bluetoothtest.lpr"/>
         <IsPartOfProject Value="True"/>
       </Unit0>
     </Units>

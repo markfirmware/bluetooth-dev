@@ -13,7 +13,7 @@ Serial,DWCOTG,FileSystem,MMC,FATFS,Keyboard;
 
 const 
  ScanUnitsPerSecond          = 1600;
- ScanInterval                = 5.000;
+ ScanInterval                = 2.000;
  ScanWindow                  = 0.500;
  RetentionLimit              = 90*1000*1000;
 
@@ -136,8 +136,8 @@ var
  Report:String;
  WorkTime:TDateTime;
 begin
- AddContent(AResponse,'<div><big><big><b>This page reloads every 5 seconds</b></big></big></div>');
- AddContent(AResponse,'<meta http-equiv="refresh" content="5">');
+ AddContent(AResponse,'<div><big><big><b>This page reloads every 2 seconds</b></big></big></div>');
+ AddContent(AResponse,'<meta http-equiv="refresh" content="2">');
  AddContent(AResponse,'ExceptionRestartCounter ' + ExceptionRestartCounter.ToString);
  AddContent(AResponse,'ScanCycleCounter ' + ScanCycleCounter.ToString);
  AddContent(AResponse,'ReadByteCounter ' + ReadByteCounter.ToString);
@@ -280,6 +280,7 @@ var
  Cmd:array of byte;
  res,count:LongWord;
  PacketType,EventCode,PacketLength,CanAcceptPackets,Status:Byte;
+ Acknowledged:Boolean;
 begin
  Inc(HciSequenceNumber);
  // if OpCode <> $fc4c then
@@ -295,21 +296,49 @@ begin
  res:=SerialDeviceWrite(UART0,@Cmd[0],length(Cmd),SERIAL_WRITE_NONE,count);
  if res = ERROR_SUCCESS then
   begin
-   PacketType:=ReadByte;
-   if PacketType <> HCI_EVENT_PKT then
-    Fail(Format('event type not hci event: %d',[PacketType]));
-   EventCode:=ReadByte;
-   if EventCode <> $0E then
-    Fail(Format('event code not command completed: %02.2x',[EventCode]));
-   PacketLength:=ReadByte;
-   if PacketLength <> 4 then
-    Fail(Format('packet length not 4: %d',[PacketLength]));
-   CanAcceptPackets:=ReadByte;
-   if CanAcceptPackets <> 1 then
-    Fail(Format('can accept packets not 1: %d',[CanAcceptPackets]));
-   ReadByte; // completed command low
-   ReadByte; // completed command high
-   Status:=ReadByte;
+   Acknowledged:=False;
+   while not Acknowledged do
+    begin
+     PacketType:=ReadByte;
+     if PacketType <> HCI_EVENT_PKT then
+      Fail(Format('event type not hci event: %d',[PacketType]));
+     EventCode:=ReadByte;
+     if EventCode = $0E then
+      begin
+       PacketLength:=ReadByte;
+       if PacketLength <> 4 then
+        Fail(Format('packet length not 4: %d',[PacketLength]));
+       CanAcceptPackets:=ReadByte;
+       if CanAcceptPackets <> 1 then
+        Fail(Format('can accept packets not 1: %d',[CanAcceptPackets]));
+       ReadByte; // completed command low
+       ReadByte; // completed command high
+       Status:=ReadByte;
+       Acknowledged:=True;
+      end
+     else if EventCode = $0F then
+           begin
+            PacketLength:=ReadByte;
+            if PacketLength <> 4 then
+             Fail(Format('packet length not 4: %d',[PacketLength]));
+            Status:=ReadByte;
+            CanAcceptPackets:=ReadByte;
+            if CanAcceptPackets <> 1 then
+             Fail(Format('can accept packets not 1: %d',[CanAcceptPackets]));
+            ReadByte; // completed command low
+            ReadByte; // completed command high
+            Acknowledged:=True;
+           end
+     else
+      begin
+       PacketLength:=ReadByte;
+       Log(Format('HciCommand discarding event %d length %d',[EventCode,PacketLength]));
+       for I:=1 to PacketLength do
+        ReadByte;
+       Sleep(5*1000);
+       // Fail(Format('event code not command completed nor status: %02.2x',[EventCode]));
+      end;
+    end;
    if Status <> 0 then
     Fail(Format('status not 0: %d',[Status]));
   end
@@ -466,6 +495,7 @@ var
 begin
  if Rssi = 127 then si := 'NU'
  else if Rssi > 128 then si := '-' + IntToStr (256 - Rssi) + 'dBm'
+ else if Rssi <= 09 then si := '+0' + IntToStr (Rssi) + 'dBm'
  else if Rssi <= 20 then si := '+' + IntToStr (Rssi) + 'dBm'
  else si := '?dBm';
  Result:=si;
@@ -479,6 +509,8 @@ var
  Line:String;
  Color:LongWord;
  StyleColor:String;
+ CounterWidth:Integer;
+ LineFormat:String;
 procedure Cull;
 var 
  NewList:Array of TMessageTrack;
@@ -514,6 +546,10 @@ begin
  Cull;
  ConsoleWindowSetXY(Console2,1,1);
  Report:='';
+ CounterWidth:=1;
+ for I:=0 to High(MessageTrackList) do
+  if Length(IntToStr(MessageTrackList[I].Count)) > CounterWidth then
+   CounterWidth:=Length(IntToStr(MessageTrackList[I].Count));
  for I:=High(MessageTrackList) downto 0 do
   with MessageTrackList[I] do
    begin
@@ -523,7 +559,8 @@ begin
           Color:=COLOR_GRAY
     else
      Color:=COLOR_YELLOW;
-    Line:=Format('%7s %4d %s %s',[dBm(Last.Rssi),Count,Key,Last.Data]);
+    LineFormat:=Format('%%7s %%%dd %%s %%s',[CounterWidth]);
+    Line:=Format(LineFormat,[dBm(Last.Rssi),Count,Key,Last.Data]);
     ConsoleWindowSetForecolor(Console2,Color);
     ConsoleWindowWrite(Console2,Line);
     StyleColor:=(Color and $ffffff).ToHexString(6);
@@ -1007,7 +1044,7 @@ var
  S:String;
  GetByteIndex:Integer;
  AddressString:String;
- MainType,MfrLo,MfrHi:Byte;
+ MainType,MfrLo,MfrHi,MainValue:Byte;
  MfrType,MfrLength,MfrFirst,MfrSecond:Byte;
  Uuid:TUuid;
  MajorLo,MajorHi,MinorLo,MinorHi:Byte;
@@ -1017,6 +1054,8 @@ var
  AltBeaconData:Array[0 .. 19] of Byte;
  AltBeaconReserved:Byte;
  AppleTvVarying:Byte;
+ AddressBytes:Array[0 .. 5] of Byte;
+ LeEventType:Byte;
 function GetByte:Byte;
 begin
  Result:=Event[GetByteIndex];
@@ -1045,22 +1084,39 @@ begin
    if I > 11 then
     begin
      S:=S + Event[I - 1].ToHexString(2);
-     if ((I + 2) mod 4) = 0 then
+     if I mod 4 = 3 then
       S:=S + ' ';
     end;
   end;
  Rssi:=ReadByte;
+ if EventSubType <> $3e then
+  begin
+   Log(Format('ParseEvent type %02.2x subtype %02.2x length %d discarded',[EventType,EventSubType,EventLength]));
+   Sleep(5*1000);
+   exit;
+  end;
  if S = '' then
   begin
    S:='(no data)';
    exit;
   end;
- GetByteIndex:=2;
+ GetByteIndex:=0;
+ LeEventType:=GetByte;
+ GetByte;
+ if LeEventType <> $02 then
+  begin
+   Log(Format('ParseEvent le event type %02.2x length %d discarded',[LeEventType,EventLength]));
+   Sleep(5*1000);
+   exit;
+  end;
  AdEventType:=GetByte;
  AddressType:=GetByte;
  AddressString:='';
- for I:=1 to 6 do
-  AddressString:=GetByte.ToHexString(2) + AddressString;
+ for I:=0 to 5 do
+  begin
+   AddressBytes[I]:=GetByte;
+   AddressString:=AddressBytes[I].ToHexString(2) + AddressString;
+  end;
  AddressString:=AddressString + MacAddressTypeToStr(AddressType) + AdEventTypeToStr(AdEventType);
  DataLength:=GetByte;
  FlagsLength:=GetByte;
@@ -1069,6 +1125,7 @@ begin
  MainLength:=GetByte;
  MainType:=GetByte;
  MfrLo:=GetByte;
+ MainValue:=MfrLo;
  MfrHi:=GetByte;
  MfrType:=GetByte;
  MfrLength:=GetByte;
@@ -1098,7 +1155,7 @@ begin
       end;
      Track(ClockGetCount,Rssi,Format('%s ult chan %d',[AddressString,MfrFirst]),S);
     end
-   else if (((MfrHi shl 8) or MfrLo) = ManufacturerMicrosoft) and (MfrType = $01) and (MfrLength = $09) and (MfrFirst = $20) and (MfrSecond = $00) then
+   else if (((MfrHi shl 8) or MfrLo) = ManufacturerMicrosoft) and (MfrType = $01) and (MfrLength = $09) and (MfrFirst = $20) then
          begin
           S:='salt ';
           GetByteIndex:=19;
@@ -1122,6 +1179,14 @@ begin
      Track(ClockGetCount,Rssi,Format('%s mfr %s %s',[AddressString,ManufacturerToString(AsWord(MfrHi,MfrLo)),S]),'');
     end;
   end
+ else if (FlagsLength = $04) and (FlagsType = $09) then
+       begin
+        S:='';
+        GetByteIndex:=13;
+        while GetByteIndex <= High(Event) do
+         S:=S + Char(GetByte);
+        Track(ClockGetCount,Rssi,Format('%s cnm <%s>',[AddressString,S]),'');
+       end
  else if (MainType = $ff) and (((MfrHi shl 8) or MfrLo) = ManufacturerApple) then
        begin
         if (MfrType = $02) and (MfrLength = $15) then
@@ -1134,7 +1199,7 @@ begin
           MinorHi:=GetByte;
           MinorLo:=GetByte;
           TransmitPower:=GetByte;
-          Track(ClockGetCount,Rssi,Format('%s ibn %7stx %s mjr %d mnr %d',[AddressString,dBm(TransmitPower),UuidToStr(Uuid),AsWord(MajorHi,MajorLo),AsWord(MinorHi,MinorLo)]),'');
+          Track(ClockGetCount,Rssi,Format('%s ibn %6stx %s mjr %d mnr %d',[AddressString,dBm(TransmitPower),UuidToStr(Uuid),AsWord(MajorHi,MajorLo),AsWord(MinorHi,MinorLo)]),'');
          end
         else if (MfrType = $09) and (MfrLength = $06) and (MfrFirst = $03) then
               begin
@@ -1149,6 +1214,14 @@ begin
               end
         else
          begin
+          S:='';
+          GetByteIndex:=18;
+          while GetByteIndex <= High(Event) do
+           begin
+            S:=S + GetByte.ToHexString(2);
+            if (GetByteIndex mod 4) = 2 then
+             S:=S + ' ';
+           end;
           Track(ClockGetCount,Rssi,Format('%s mfr %s %s',[AddressString,ManufacturerToString(AsWord(MfrHi,MfrLo)),S]),'');
          end
        end
@@ -1165,7 +1238,7 @@ begin
          end;
         TransmitPower:=GetByte;
         AltBeaconReserved:=GetByte;
-        Track(ClockGetCount,Rssi,Format('%s abn %7stx id %s reserved %02.2x',[AddressString,dBm(TransmitPower),S,AltBeaconReserved]),'');
+        Track(ClockGetCount,Rssi,Format('%s abn %6stx id %s reserved %02.2x',[AddressString,dBm(TransmitPower),S,AltBeaconReserved]),'');
        end
  else if (MainType = $ff) then
        begin
@@ -1196,7 +1269,7 @@ begin
             Instance[I]:=GetByte;
             S:=S + Instance[I].ToHexString(2);
            end;
-          Track(ClockGetCount,Rssi,Format('%s uid %7stx %s',[AddressString,dBm(TransmitPower),S]),'');
+          Track(ClockGetCount,Rssi,Format('%s uid %6stx %s',[AddressString,dBm(TransmitPower),S]),'');
          end
         else if EddystoneType = $10 then
               begin
@@ -1211,7 +1284,7 @@ begin
                  else
                   S:=S + Char(C);
                 end;
-               Track(ClockGetCount,Rssi,Format('%s url %7stx %s',[AddressString,dBm(TransmitPower),S]),'');
+               Track(ClockGetCount,Rssi,Format('%s url %6stx %s',[AddressString,dBm(TransmitPower),S]),'');
               end
         else if EddystoneType = $20 then
               begin
@@ -1231,11 +1304,11 @@ begin
                  EphemeralId[I]:=GetByte;
                  S:=S + NameSpace[I].ToHexString(2);
                 end;
-               Track(ClockGetCount,Rssi,Format('%s eid %7stx %s',[AddressString,dBm(TransmitPower),S]),'');
+               Track(ClockGetCount,Rssi,Format('%s eid %6stx %s',[AddressString,dBm(TransmitPower),S]),'');
               end
         else
          begin
-          Track(ClockGetCount,Rssi,Format('%s hex %s',[AddressString,S]),'');
+          Track(ClockGetCount,Rssi,Format('%s hex1 %s',[AddressString,S]),'');
           Log(Format('%s hex %s',[AddressString,S]));
          end;
        end
