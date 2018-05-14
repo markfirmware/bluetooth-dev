@@ -101,6 +101,7 @@ var
  KeyboardLoopHandle:TThreadHandle = INVALID_HANDLE_VALUE;
  MonitorLoopHandle:TThreadHandle = INVALID_HANDLE_VALUE;
  IpAddressLoopHandle:TThreadHandle = INVALID_HANDLE_VALUE;
+ LedLoopHandle:TThreadHandle = INVALID_HANDLE_VALUE;
  ReadByteCounter:Integer;
  Scheme:Array[0..3] of String = ('http://www.','https://www.','http://','https://');
  Expansion:Array[0..13] of String = ('.com/','.org/','.edu/','.net/','.info/','.biz','.gov/','.com','.org','.edu','.net','.info','.biz','.gov');
@@ -386,6 +387,7 @@ var
  UpTime:Int64;
  Temperature:Double;
  Message:String;
+ PublicIp:String;
 const 
  Part1 = 'ultibo';
 procedure AddByte(X:Byte);
@@ -426,11 +428,12 @@ begin
     begin
      AddByte($10);
      AddByte($00);
-     if IpAddressAvailable then
+     PublicIp:=SysUtils.GetEnvironmentVariable('PUBLIC_IP');
+     if IpAddressAvailable and (PublicIp <> '') then
       begin
        AddByte($02);
-       for I:=1 to Length(IpAddress) do
-        AddByte(Ord(IpAddress[I]));
+       for I:=Low(PublicIp) to High(PublicIp) do
+        AddByte(Ord(PublicIp[I]));
       end
      else
       begin
@@ -511,6 +514,9 @@ var
  StyleColor:String;
  CounterWidth:Integer;
  LineFormat:String;
+ LineHtml:String;
+ HttpPos:Integer;
+ JustUrl:String;
 procedure Cull;
 var 
  NewList:Array of TMessageTrack;
@@ -564,7 +570,18 @@ begin
     ConsoleWindowSetForecolor(Console2,Color);
     ConsoleWindowWrite(Console2,Line);
     StyleColor:=(Color and $ffffff).ToHexString(6);
-    Report:=Report + '<div style=background-color:#' + StyleColor +';">' + Line + '</div>';
+    HttpPos:=Pos('http://',Line);
+    if HttpPos = 0 then
+     HttpPos:=Pos('https://',Line);
+    if HttpPos <> 0 then
+     begin
+      JustUrl:=RightStr(Line,Length(Line) - HttpPos + 1);
+      JustUrl:=LeftStr(JustUrl,Length(JustUrl) - 1);
+      LineHtml:=LeftStr(Line,HttpPos - 1) + Format('<a href=%s>%s</a>',[JustUrl,JustUrl]);
+     end
+    else
+     LineHtml:=Line;
+    Report:=Report + '<div style=background-color:#' + StyleColor +';">' + LineHtml + '</div>';
     ConsoleWindowClearEx(Console2,ConsoleWindowGetX(Console2),ConsoleWindowGetY(Console2),ConsoleWindowGetMaxX(Console2),ConsoleWindowGetY(Console2),False);
     ConsoleWindowWriteLn(Console2,'');
    end;
@@ -1051,7 +1068,8 @@ var
  NameSpace:Array[0 .. 9] of Byte;
  Instance:Array[0 .. 5] of Byte;
  EphemeralId:Array[0 .. 7] of Byte;
- AltBeaconData:Array[0 .. 19] of Byte;
+ AltBeaconUuid:TUuid;
+ AltBeaconFourBytes:Array [0 .. 3] of Byte;
  AltBeaconReserved:Byte;
  AppleTvVarying:Byte;
  AddressBytes:Array[0 .. 5] of Byte;
@@ -1228,17 +1246,17 @@ begin
  else if (MainType = $ff) and (((MfrHi shl 8) or MfrLo) = ManufacturerTesting) and (MfrType = $BE) and (MfrLength = $AC) then
        begin
         GetByteIndex:=20;
+        for I:=0 to High(AltBeaconUuid) do
+         AltBeaconUuid[I]:=GetByte;
         S:='';
-        for I:=0 to High(AltBeaconData) do
+        for I:=0 to High(AltBeaconFourBytes) do
          begin
-          AltBeaconData[I]:=GetByte;
-          S:=S + AltBeaconData[I].ToHexString(2);
-          if (I mod 4) = 3 then
-           S:=S + ' ';
+          AltBeaconFourBytes[I]:=GetByte;
+          S:=S + AltBeaconFourBytes[I].ToHexString(2);
          end;
         TransmitPower:=GetByte;
         AltBeaconReserved:=GetByte;
-        Track(ClockGetCount,Rssi,Format('%s abn %6stx id %s reserved %02.2x',[AddressString,dBm(TransmitPower),S,AltBeaconReserved]),'');
+        Track(ClockGetCount,Rssi,Format('%s abn %6stx %s %s reserved %02.2x',[AddressString,dBm(TransmitPower),UuidToStr(AltBeaconUuid),S,AltBeaconReserved]),'');
        end
  else if (MainType = $ff) then
        begin
@@ -1362,6 +1380,19 @@ end;
 FlushRx;
 end;
 
+function LedLoop(Parameter:Pointer):PtrInt;
+begin
+ Result:=0;
+ ActivityLedEnable;
+ while True do
+  begin
+   ActivityLedOn;
+   Sleep(100);
+   ActivityLedOff;
+   Sleep(900);
+  end;
+end;
+
 begin
  Console1 := ConsoleWindowCreate(ConsoleDeviceGetDefault,CONSOLE_POSITION_TOPRIGHT,True);
  Console2 := ConsoleWindowCreate(ConsoleDeviceGetDefault,CONSOLE_POSITION_LEFT,False);
@@ -1397,6 +1428,7 @@ begin
    BCMLoadFirmware(BluetoothMiniDriverFileName);
    SetLEEventMask($ff);
    Log('Init complete');
+   BeginThread(@LedLoop,Nil,LedLoopHandle,THREAD_STACK_DEFAULT_SIZE);
    ExceptionRestartCounter:=0;
    ScanCycleCounter:=0;
    ReadByteCounter:=0;

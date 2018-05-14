@@ -31,4 +31,4 @@ zip $ZIPFILE *
 ls -lt $ZIPFILE
 cd ..
 
-hub release create -d -p -F release/release-message.md -a release/$ZIPFILE $VERSION
+#hub release create -d -p -F release/release-message.md -a release/$ZIPFILE $VERSION
