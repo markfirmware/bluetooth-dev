@@ -15,7 +15,7 @@ const
  ScanUnitsPerSecond          = 1600;
  ScanInterval                = 2.000;
  ScanWindow                  = 0.500;
- RetentionLimit              = 90*1000*1000;
+ RetentionLimit              = 120*1000*1000;
 
  HCI_COMMAND_PKT             = $01;
  HCI_EVENT_PKT               = $04;
@@ -132,6 +132,16 @@ begin
  Log(Format('Restoring from %s done',[Source]));
 end;
 
+function SecondsToTime(Seconds:Integer):TDateTime;
+begin
+ Result:=(Seconds div PASCAL_TIME_SECONDS_PER_DAY) + ((Seconds mod PASCAL_TIME_SECONDS_PER_DAY) / PASCAL_TIME_SECONDS_PER_DAY);
+end;
+
+function TimeToString(Time:TDateTime):String;
+begin
+ Result:=IntToStr(Trunc(Time)) + ' days ' + TimeToStr(Time);
+end;
+
 function TBluetoothWebStatus.DoContent(AHost:THTTPHost;ARequest:THTTPServerRequest;AResponse:THTTPServerResponse):Boolean;
 var 
  Report:String;
@@ -143,7 +153,7 @@ begin
  AddContent(AResponse,'ScanCycleCounter ' + ScanCycleCounter.ToString);
  AddContent(AResponse,'ReadByteCounter ' + ReadByteCounter.ToString);
  WorkTime:=SystemFileTimeToDateTime(UpTime);
- AddContent(AResponse,'Up ' + IntToStr(Trunc(WorkTime)) + ' days ' + TimeToStr(WorkTime));
+ AddContent(AResponse,'Up ' + TimeToString(WorkTime));
  SemaphoreWait(HtmlReportLock);
  Report:=HtmlReport;
  SemaphoreSignal(HtmlReportLock);
@@ -410,7 +420,7 @@ begin
  SetLength(EddystoneServiceData,0);
  if (ScanCycleCounter mod 6) = 0 then
   begin
-   Message:=Format('up %4.2fs',[ClockGetTotal / (1000*1000)]);
+   Message:=Format('up %s',[TimeToString(SecondsToTime(ClockGetTotal div (1000*1000)))]);
    AddByte($ff);
    AddByte($ff);
    AddByte($55);
@@ -723,7 +733,10 @@ begin
    Log('Can''t find UART0');
    exit;
   end;
- res:=SerialDeviceOpen(UART0,115200,SERIAL_DATA_8BIT,SERIAL_STOP_1BIT,SERIAL_PARITY_NONE,SERIAL_FLOW_NONE,0,0);
+ if BoardGetType = BOARD_TYPE_RPI_ZERO_W then
+  res:=SerialDeviceOpen(UART0,115200,SERIAL_DATA_8BIT,SERIAL_STOP_1BIT,SERIAL_PARITY_NONE,SERIAL_FLOW_RTS_CTS,0,0)
+ else
+  res:=SerialDeviceOpen(UART0,115200,SERIAL_DATA_8BIT,SERIAL_STOP_1BIT,SERIAL_PARITY_NONE,SERIAL_FLOW_NONE,0,0);
  if res = ERROR_SUCCESS then
   begin
    Result:=True;
@@ -737,9 +750,16 @@ begin
 
    GPIOFunctionSelect(GPIO_PIN_32,GPIO_FUNCTION_ALT3);     // TXD0
    GPIOFunctionSelect(GPIO_PIN_33,GPIO_FUNCTION_ALT3);     // RXD0
-
    GPIOPullSelect(GPIO_PIN_32,GPIO_PULL_NONE);             //Added
    GPIOPullSelect(GPIO_PIN_33,GPIO_PULL_UP);               //Added
+
+   if BoardGetType = BOARD_TYPE_RPI_ZERO_W then
+    begin
+     GPIOFunctionSelect(GPIO_PIN_30,GPIO_FUNCTION_ALT3);     // RTS
+     GPIOFunctionSelect(GPIO_PIN_31,GPIO_FUNCTION_ALT3);     // CTS
+     GPIOPullSelect(GPIO_PIN_30,GPIO_PULL_UP);
+     GPIOPullSelect(GPIO_PIN_31,GPIO_PULL_NONE);
+    end;
 
    Sleep(50);
   end;
@@ -1010,6 +1030,20 @@ var
  MessageTrack:TMessageTrack;
  I,N:Integer;
 begin
+ if LeftStr(NewData,5) = 'salt ' then
+  begin
+   for I:=0 to High(MessageTrackList) do
+    with MessageTrackList[I] do
+     if (NewData = Last.Data) and (NewKey <> Key) then
+      begin
+       Inc(Count);
+       Log(Format('%s was %s',[NewKey,Key]));
+       Key:=NewKey;
+       Last.TimeStamp:=NewTimeStamp;
+       Last.Rssi:=NewRssi;
+       exit;
+      end;
+  end;
  for I:=0 to High(MessageTrackList) do
   with MessageTrackList[I] do
    if NewKey = Key then
@@ -1182,7 +1216,7 @@ begin
           S:=S + ' hash ';
           while GetByteIndex <= High(Event) do
            S:=S + GetByte.ToHexString(2);
-          Track(ClockGetCount,Rssi,Format('%s mfr win10 %s',[AddressString,S]),'');
+          Track(ClockGetCount,Rssi,Format('%s mfr win10',[AddressString]),S);
          end
    else
     begin
@@ -1240,7 +1274,7 @@ begin
             if (GetByteIndex mod 4) = 2 then
              S:=S + ' ';
            end;
-          Track(ClockGetCount,Rssi,Format('%s mfr %s %s',[AddressString,ManufacturerToString(AsWord(MfrHi,MfrLo)),S]),'');
+          Track(ClockGetCount,Rssi,Format('%s mfr %s %s',[AddressString,ManufacturerToString(AsWord(MfrHi,MfrLo)),LeftStr(S,4)]),RightStr(S,Length(S) - 4));
          end
        end
  else if (MainType = $ff) and (((MfrHi shl 8) or MfrLo) = ManufacturerTesting) and (MfrType = $BE) and (MfrLength = $AC) then
@@ -1311,7 +1345,7 @@ begin
                TlmTemperature:=GetWord;
                TlmAdvCount:=GetLongWord;
                TlmSecCount:=GetLongWord;
-               Track(ClockGetCount,Rssi,Format('%s tlm',[AddressString]),Format('battery %5.3fV temp %3d.%02.2dC adv %d time %3.1fs',[TlmBattery*0.001,(TlmTemperature shr 8),TlmTemperature and $ff,TlmAdvCount,TlmSecCount*0.1]));
+               Track(ClockGetCount,Rssi,Format('%s tlm',[AddressString]),Format('battery %5.3fV temp %3d.%02.2dC adv %d up %s',[TlmBattery*0.001,(TlmTemperature shr 8),TlmTemperature and $ff,TlmAdvCount,TimeToString(SecondsToTime(TlmSecCount div 10))]));
               end
         else if EddystoneType = $30 then
               begin
