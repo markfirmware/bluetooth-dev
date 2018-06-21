@@ -1,27 +1,24 @@
 program BluetoothTest;
 {$mode objfpc}{$modeswitch advancedrecords}{$H+}
 
-{$define USE_WEB_STATUS}
-
 uses 
 {$ifdef BUILD_RPI } BCM2708,BCM2835, {$endif}
 {$ifdef BUILD_RPI2} BCM2709,BCM2836, {$endif}
 {$ifdef BUILD_RPI3} BCM2710,BCM2837, {$endif}
 GlobalConfig,GlobalConst,GlobalTypes,Platform,Threads,SysUtils,Classes,Console,Logging,Ultibo,WinSock2,
-{$ifdef USE_WEB_STATUS} HTTP,WebStatus,SMSC95XX, {$endif}
-Serial,DWCOTG,FileSystem,MMC,FATFS,Keyboard;
+HTTP,WebStatus,SMSC95XX,
+Serial,DWCOTG,FileSystem,MMC,FATFS,Keyboard,bcmfw;
 
 const 
  ScanUnitsPerSecond          = 1600;
- ScanInterval                = 2.000;
- ScanWindow                  = 0.500;
+ ScanInterval                = 1.000;
+ ScanWindow                  = 0.250;
  RetentionLimit              = 120*1000*1000;
+ FilterMinRxCount            = 5;
 
  HCI_COMMAND_PKT             = $01;
  HCI_EVENT_PKT               = $04;
- OGF_MARKER                  = $00;
  OGF_HOST_CONTROL            = $03;
- OGF_INFORMATIONAL           = $04;
  OGF_LE_CONTROL              = $08;
  OGF_VENDOR                  = $3f;
  LL_SCAN_PASSIVE             = $00;
@@ -46,16 +43,21 @@ const
  ADT_POWER_LEVEL             = $0A; // Tx Power Level
  ADT_DEVICE_CLASS            = $0D; // Class of Device
  ADT_SERVICE_DATA            = $16; // Service data, starts with service uuid followed by data
+ ADT_DEVICE_APPEARANCE       = $19; // Device appearance
  ADT_MANUFACTURER_SPECIFIC   = $FF;
 
- ManufacturerTesting         = $ffff;
  ManufacturerApple           = $004c;
+ ManufacturerEstimote        = $015d;
+ ManufacturerFlic            = $030f;
+ ManufacturerLogitech        = $01da;
  ManufacturerMicrosoft       = $0006;
+ ManufacturerTesting         = $ffff;
  EddystoneUuid               = $feaa;
 
  BDADDR_LEN                  = 6;
 
 type 
+ TArrayOfByte = Array of Byte;
  TUuid = Array[0 .. 15] of Byte;
  TBDAddr = Array[0 .. BDADDR_LEN - 1] of Byte;
  TBluetoothWebStatus = class(TWebStatusCustom)
@@ -72,16 +74,52 @@ type
   First:TMessage;
   Last:TMessage;
  end;
+ TBleConnection = record
+  Key:String;
+ end;
+
+ TBleAd = record
+  BytesLength:Integer;
+  Bytes:Array[0 .. 31] of Byte;
+  function ToDisplayString:String;
+  Case AdType:Integer of 
+   ADT_FLAGS                   : (Flags:Byte);
+   ADT_INCOMPLETE_UUID16       : ();
+   ADT_COMPLETE_UUID16         : (Uuid16:Word);
+   ADT_INCOMPLETE_UUID32       : ();
+   ADT_COMPLETE_UUID32         : ();
+   ADT_INCOMPLETE_UUID128      : ();
+   ADT_COMPLETE_UUDI128        : ();
+   ADT_SHORTENED_LOCAL_NAME    : ();
+   ADT_COMPLETE_LOCAL_NAME     : (NameLength:Integer;Name:Array [0 .. 31] of Byte);
+   ADT_POWER_LEVEL             : (PowerLevel:Byte);
+   ADT_DEVICE_CLASS            : ();
+   ADT_SERVICE_DATA            : (SdUuid16:Word;SdDataLength:Integer;SdData:Array [0 .. 31] of Byte);
+   ADT_DEVICE_APPEARANCE       : (Appearance:Word);
+   ADT_MANUFACTURER_SPECIFIC   : (Mfr:Word;MfrDataLength:Integer;MfrData:Array [0 .. 31] of Byte);
+ end;
+
+ TBleAdPacket = record
+  AdsLength:Integer;
+  Ads:Array[0 .. 9] of TBleAd;
+  function ToDisplayString:String;
+  procedure EraseAds;
+  procedure AddFlags(Flags:Byte);
+  procedure AddServiceAds(Uuid16:Word;Data:Array of Byte);
+  function Bytes:TArrayOfByte;
+  function IsFlags(Index:Integer;Flags:Byte):Boolean;
+  function IsMfr(Index:Integer;Mfr:Word;Prefix:Array of Byte;RemainingSize:Integer):Boolean;
+ end;
 
 var 
  ExceptionRestartCounter:Integer;
  DropByte:Boolean;
+ ScanRxCount:Integer;
  RestartBroadcastObserveLoop:Boolean;
  BluetoothUartDeviceDescription:String;
- BluetoothMiniDriverFileName:String;
  ScanCycleCounter:LongWord;
  ScanIdle:Boolean;
- StartTime:LongWord;
+ ScanStartTime:LongWord;
  Margin:LongWord;
  ReadBackLog:Integer;
  BluetoothWebStatus:TBluetoothWebStatus;
@@ -92,10 +130,10 @@ var
  LastDeviceStatus:LongWord;
  SerialDeviceStatusEntryCounter,SerialDeviceStatusExitCounter:LongWord;
  MessageTrackList:Array of TMessageTrack;
+ ConnectionList:Array of TBleConnection;
  AdData:Array of Byte;
- FWHandle:integer;
  HciSequenceNumber:Integer = 0;
- Console1,Console2:TWindowHandle;
+ Console1,Console2,Console3:TWindowHandle;
  ch:char;
  UART0:PSerialDevice = Nil;
  KeyboardLoopHandle:TThreadHandle = INVALID_HANDLE_VALUE;
@@ -105,10 +143,8 @@ var
  ReadByteCounter:Integer;
  Scheme:Array[0..3] of String = ('http://www.','https://www.','http://','https://');
  Expansion:Array[0..13] of String = ('.com/','.org/','.edu/','.net/','.info/','.biz','.gov/','.com','.org','.edu','.net','.info','.biz','.gov');
-
-{$ifdef USE_WEB_STATUS}
  HTTPListener:THTTPListener;
-{$endif}
+ HTTPRedirect:THTTPRedirect;
 
 function ReadByte:Byte; forward;
 procedure StopAdvertising; forward;
@@ -147,13 +183,16 @@ var
  Report:String;
  WorkTime:TDateTime;
 begin
- AddContent(AResponse,'<div><big><big><b>This page reloads every 2 seconds</b></big></big></div>');
- AddContent(AResponse,'<meta http-equiv="refresh" content="2">');
+ AddContent(AResponse,'<meta http-equiv="refresh" content="1">');
+ AddContent(AResponse,'<div><big><big><b>This page reloads every second</b></big></big></div>');
  AddContent(AResponse,'ExceptionRestartCounter ' + ExceptionRestartCounter.ToString);
  AddContent(AResponse,'ScanCycleCounter ' + ScanCycleCounter.ToString);
  AddContent(AResponse,'ReadByteCounter ' + ReadByteCounter.ToString);
  WorkTime:=SystemFileTimeToDateTime(UpTime);
  AddContent(AResponse,'Up ' + TimeToString(WorkTime));
+ AddContent(AResponse,'<div>');
+ AddContent(AResponse,'FilterMinRxCount ' + FilterMinRxCount.ToString);
+ AddContent(AResponse,'</div>');
  SemaphoreWait(HtmlReportLock);
  Report:=HtmlReport;
  SemaphoreSignal(HtmlReportLock);
@@ -392,7 +431,8 @@ end;
 
 procedure UpdateBeacon;
 var 
- EddystoneServiceData:Array of Byte;
+ Packet:TBleAdPacket;
+ PacketData:Array of Byte;
  I:Integer;
  UpTime:Int64;
  Temperature:Double;
@@ -402,8 +442,8 @@ const
  Part1 = 'ultibo';
 procedure AddByte(X:Byte);
 begin
- SetLength(EddystoneServiceData,Length(EddystoneServiceData) + 1);
- EddystoneServiceData[Length(EddystoneServiceData) - 1]:=X;
+ SetLength(PacketData,Length(PacketData) + 1);
+ PacketData[Length(PacketData) - 1]:=X;
 end;
 procedure AddWord(X:Word);
 begin
@@ -417,69 +457,52 @@ begin
 end;
 begin
  ClearAdvertisingData;
- SetLength(EddystoneServiceData,0);
+ SetLength(PacketData,0);
  if (ScanCycleCounter mod 6) = 0 then
   begin
-   Message:=Format('up %s',[TimeToString(SecondsToTime(ClockGetTotal div (1000*1000)))]);
-   AddByte($ff);
-   AddByte($ff);
-   AddByte($55);
-   AddByte($4c);
-   AddByte(34);
-   for I:=Low(Message) to High(Message) do
-    AddByte(Ord(Message[I]));
-   AddAdvertisingData(ADT_MANUFACTURER_SPECIFIC,EddystoneServiceData);
-  end
- else
-  begin
-   AddByte(Lo(EddystoneUuid));
-   AddByte(Hi(EddystoneUuid));
-   if (ScanCycleCounter mod 6) = 1 then
+   AddByte($10);
+   AddByte($00);
+   PublicIp:=SysUtils.GetEnvironmentVariable('PUBLIC_IP_ADDRESS');
+   if IpAddressAvailable and (PublicIp <> '') then
     begin
-     AddByte($10);
-     AddByte($00);
-     PublicIp:=SysUtils.GetEnvironmentVariable('PUBLIC_IP');
-     if IpAddressAvailable and (PublicIp <> '') then
-      begin
-       AddByte($02);
-       for I:=Low(PublicIp) to High(PublicIp) do
-        AddByte(Ord(PublicIp[I]));
-      end
-     else
-      begin
-       AddByte($03);
-       for I:=1 to Length(Part1) do
-        AddByte(Ord(Part1[I]));
-       AddByte($08);
-      end;
+     AddByte($02);
+     for I:=Low(PublicIp) to High(PublicIp) do
+      AddByte(Ord(PublicIp[I]));
     end
    else
     begin
-     UpTime:=ClockGetTotal;
-     Temperature:=TemperatureGetCurrent(TEMPERATURE_ID_SOC) / 1000;
-     AddByte($20);
-     AddByte($00);
-     AddWord(4993);
-     AddWord((Trunc(Temperature) shl 8) or Round((Temperature - Trunc(Temperature))*100));
-     AddLongWord(UpTime div (1*1000*1000));
-     AddLongWord(UpTime div (100*1000));
+     AddByte($03);
+     for I:=1 to Length(Part1) do
+      AddByte(Ord(Part1[I]));
+     AddByte($08);
     end;
-   AddAdvertisingData(ADT_FLAGS,[$18]);
-   AddAdvertisingData(ADT_COMPLETE_UUID16,[Lo(EddystoneUuid),Hi(EddystoneUuid)]);
-   AddAdvertisingData(ADT_SERVICE_DATA,EddystoneServiceData);
+  end
+ else
+  begin
+   UpTime:=ClockGetTotal;
+   Temperature:=TemperatureGetCurrent(TEMPERATURE_ID_SOC) / 1000;
+   AddByte($20);
+   AddByte($00);
+   AddWord(4993);
+   AddWord((Trunc(Temperature) shl 8) or Round((Temperature - Trunc(Temperature))*100));
+   AddLongWord(UpTime div (1*1000*1000));
+   AddLongWord(UpTime div (100*1000));
   end;
- SetLEAdvertisingData(AdData);
+ Packet.EraseAds;
+ Packet.AddFlags($18);
+ Packet.AddServiceAds(EddyStoneUuid,PacketData);
+ SetLEAdvertisingData(Packet.Bytes);
  ClearAdvertisingData;
- SetLength(EddyStoneServiceData,0);
- Message:=Format('no09 mile %4.1f',[(ClockGetTotal / (1000*1000)) / 500 + 45]);
+ SetLength(PacketData,0);
  AddByte($ff);
  AddByte($ff);
  AddByte($55);
- AddByte($4c);
- AddByte(18);
+ AddByte($96);
+ AddByte(34);
+ Message:=Format('up %s',[TimeToString(SecondsToTime(ClockGetTotal div (1000*1000)))]);
  for I:=Low(Message) to High(Message) do
   AddByte(Ord(Message[I]));
- AddAdvertisingData(ADT_MANUFACTURER_SPECIFIC,EddystoneServiceData);
+ AddAdvertisingData(ADT_MANUFACTURER_SPECIFIC,PacketData);
  SetLEScanResponseData(AdData);
 end;
 
@@ -512,6 +535,10 @@ begin
  else if Rssi <= 20 then si := '+' + IntToStr (Rssi) + 'dBm'
  else si := '?dBm';
  Result:=si;
+end;
+
+procedure ProcessConnections;
+begin
 end;
 
 procedure EndOfScan;
@@ -569,6 +596,8 @@ begin
  for I:=High(MessageTrackList) downto 0 do
   with MessageTrackList[I] do
    begin
+    if Count < FilterMinRxCount then
+     continue;
     if LongWord(Now - Last.TimeStamp) > RetentionLimit - 15*1000*1000 then
      Color:=COLOR_RED
     else if LongWord(Now - Last.TimeStamp) > RetentionLimit - 30*1000*1000 then
@@ -623,22 +652,25 @@ begin
      if ScanIdle then
       begin
        ScanIdle:=False;
-       StartTime:=Now;
+       ScanStartTime:=Now;
+       ScanRxCount:=0;
        if (ScanCycleCounter >= 1) and (LongWord(Now - EntryTime) div 1000 < Margin) then
         begin
          Margin:=LongWord(Now - EntryTime) div 1000;
          LoggingOutput(Format('lowest available processing time between scans is now %5.3fs',[Margin / 1000]));
         end;
       end;
+     Inc(ScanRxCount);
      exit;
     end
    else
     begin
-     if (not ScanIdle) and (LongWord(Now - StartTime)/(1*1000*1000)  > ScanWindow + 0.500)  then
+     if (not ScanIdle) and (LongWord(Now - ScanStartTime)/(1*1000*1000)  > ScanWindow + 0.200)  then
       begin
        ScanIdle:=True;
        Inc(ScanCycleCounter);
        EndOfScan;
+       ProcessConnections;
       end;
      ThreadYield;
     end;
@@ -700,17 +732,17 @@ begin
   BOARD_TYPE_RPI3B:
                    begin
                     BluetoothUartDeviceDescription:='BCM2837 PL011 UART';
-                    BluetoothMiniDriverFileName:='BCM43430A1.hcd';
+                    PrepareBcmFirmware(0);
                    end;
   BOARD_TYPE_RPI3B_PLUS:
                         begin
                          BluetoothUartDeviceDescription:='BCM2837 PL011 UART';
-                         BluetoothMiniDriverFileName:='BCM4345C0.hcd';
+                         PrepareBcmFirmware(1);
                         end;
   BOARD_TYPE_RPI_ZERO_W:
                         begin
                          BluetoothUartDeviceDescription:='BCM2835 PL011 UART';
-                         BluetoothMiniDriverFileName:='BCM43430A1.hcd';
+                         PrepareBcmFirmware(0);
                         end;
   else
    begin
@@ -776,38 +808,40 @@ begin
  UART0:=Nil;
 end;
 
-procedure BCMLoadFirmware(fn:string);
+procedure BCMLoadFirmware;
 var 
- hdr:array [0 .. 2] of byte;
  Params:array of byte;
- n,len:integer;
+ len:integer;
  Op:Word;
+ Index:Integer;
+ I:Integer;
+ P:Pointer;
+function GetByte:Byte;
 begin
- FWHandle:=FSFileOpen(fn,fmOpenRead);
- if FWHandle > 0 then
+ Result:=PByte(P)^;
+ Inc(P);
+ Inc(Index);
+end;
+begin
+ Log('Firmware load ...');
+ HciCommand(OGF_VENDOR,$2e,[]);
+ Index:=0;
+ P:=BcmFirmwarePointer;
+ while Index < BcmFirmwareLength do
   begin
-   Log('Firmware load ...');
-   HciCommand(OGF_VENDOR,$2e,[]);
-   n:=FSFileRead(FWHandle,hdr,3);
-   while (n = 3) do
-    begin
-     Op:=(hdr[1] * $100) + hdr[0];
-     len:=hdr[2];
-     SetLength(Params,len);
-     n:=FSFileRead(FWHandle,Params[0],len);
-     if (len <> n) then Log('Data mismatch.');
-     HciCommand(Op,Params);
-     n:=FSFileRead(FWHandle,hdr,3);
-    end;
-   FSFileClose(FWHandle);
-   CloseUart0;
-   Sleep(50);
-   OpenUart0;
-   Sleep(50);
-   Log('Firmware load done');
-  end
- else
-  Log('Error loading Firmware file ' + fn);
+   Op:=GetByte;
+   Op:=Op or (GetByte shl 8);
+   Len:=GetByte;
+   SetLength(Params,Len);
+   for I:= 0 to Len - 1 do
+    Params[I]:=GetByte;
+   HciCommand(Op,Params);
+  end;
+ CloseUart0;
+ Sleep(50);
+ OpenUart0;
+ Sleep(50);
+ Log('Firmware load done');
 end;
 
 procedure WaitForSDDrive;
@@ -998,11 +1032,14 @@ end;
 function ManufacturerToString(Mfr:Word):String;
 begin
  case Mfr of 
-  ManufacturerTesting:Result:='Testing';
   ManufacturerApple:Result:='Apple';
+  ManufacturerEstimote:Result:='Estimote';
+  ManufacturerFlic:Result:='Flic';
+  ManufacturerLogitech:Result:='Logitech';
   ManufacturerMicrosoft:Result:='Microsoft';
+  ManufacturerTesting:Result:='Testing';
   else
-   Result:='Mfr?';
+   Result:=Format('mr,%04.4x',[Mfr]);
  end;
 end;
 
@@ -1037,7 +1074,6 @@ begin
      if (NewData = Last.Data) and (NewKey <> Key) then
       begin
        Inc(Count);
-       Log(Format('%s was %s',[NewKey,Key]));
        Key:=NewKey;
        Last.TimeStamp:=NewTimeStamp;
        Last.Rssi:=NewRssi;
@@ -1080,8 +1116,275 @@ begin
           uuid[8], uuid[9], uuid[10], uuid[11], uuid[12], uuid[13], uuid[14], uuid[15]])
 end;
 
+function ParseAd(Index:Integer;Data:Array of Byte):TBleAd;
+var 
+ I:Integer;
+function NextByte:Byte;
+begin
+ if Index > High(Data) then
+  Fail('ParseAd underflow');
+ Result:=Data[Index];
+ Inc(Index);
+end;
+begin
+ Result.BytesLength:=NextByte - 1;
+ Result.AdType:=NextByte;
+ for I:=0 to Result.BytesLength - 1 do
+  begin
+   if I > High(Result.Bytes) then
+    Fail('ParseAd overflow');
+   Result.Bytes[I]:=NextByte;
+  end;
+ case Result.AdType of 
+  ADT_FLAGS:
+            begin
+             Result.Flags:=Result.Bytes[0];
+            end;
+  ADT_COMPLETE_UUID16:
+                      begin
+                       Result.Uuid16:=AsWord(Result.Bytes[1],Result.Bytes[0]);
+                      end;
+  ADT_POWER_LEVEL:
+                  begin
+                   Result.PowerLevel:=Result.Bytes[0];
+                  end;
+  ADT_COMPLETE_LOCAL_NAME:
+                          begin
+                           Result.NameLength:=Result.BytesLength;
+                           for I:=0 to Result.NameLength - 1 do
+                            Result.Name[I]:=Result.Bytes[I];
+                          end;
+  ADT_SERVICE_DATA:
+                   begin
+                    Result.SdUuid16:=AsWord(Result.Bytes[1],Result.Bytes[0]);
+                    Result.SdDataLength:=Result.BytesLength - 2;
+                    for I:=0 to Result.SdDataLength - 1 do
+                     Result.SdData[I]:=Result.Bytes[I + 2];
+                   end;
+  ADT_DEVICE_APPEARANCE:
+                        begin
+                         Result.Appearance:=AsWord(Result.Bytes[1],Result.Bytes[0]);
+                        end;
+  ADT_MANUFACTURER_SPECIFIC:
+                            begin
+                             Result.Mfr:=AsWord(Result.Bytes[1],Result.Bytes[0]);
+                             Result.MfrDataLength:=Result.BytesLength - 2;
+                             for I:=0 to Result.MfrDataLength - 1 do
+                              Result.MfrData[I]:=Result.Bytes[I + 2];
+                            end;
+ end;
+end;
+
+procedure TBleAdPacket.EraseAds;
+begin
+ AdsLength:=0;
+end;
+
+procedure TBleAdPacket.AddFlags(Flags:Byte);
+begin
+ Ads[AdsLength].AdType:=ADT_FLAGS;
+ Ads[AdsLength].Flags:=Flags;
+ Inc(AdsLength);
+end;
+
+procedure TBleAdPacket.AddServiceAds(Uuid16:Word;Data:Array of Byte);
+var 
+ I:Integer;
+begin
+ Ads[AdsLength].AdType:=ADT_COMPLETE_UUID16;
+ Ads[AdsLength].Uuid16:=Uuid16;
+ Inc(AdsLength);
+ Ads[AdsLength].AdType:=ADT_SERVICE_DATA;
+ Ads[AdsLength].SdUuid16:=Uuid16;
+ Ads[AdsLength].SdDataLength:=Length(Data);
+ for I:=0 to High(Data) do
+  Ads[AdsLength].SdData[I]:=Data[I];
+ Inc(AdsLength);
+end;
+
+function TBleAdPacket.Bytes:TArrayOfByte;
+var 
+ Index,I:Integer;
+procedure PutByte(Data:Byte);
+begin
+ SetLength(Result,Length(Result) + 1);
+ Result[Length(Result) - 1]:=Data;
+end;
+procedure PutWord(Data:Word);
+begin
+ PutByte(Lo(Data));
+ PutByte(Hi(Data));
+end;
+begin
+ SetLength(Result,0);
+ for Index:=0 to AdsLength - 1 do
+  with Ads[Index] do
+   case AdType of 
+    ADT_FLAGS:
+              begin
+               PutByte(2);
+               PutByte(AdType);
+               PutByte(Flags);
+              end;
+    ADT_COMPLETE_UUID16:
+                        begin
+                         PutByte(3);
+                         PutByte(AdType);
+                         PutWord(Uuid16);
+                        end;
+    ADT_SERVICE_DATA:
+                     begin
+                      PutByte(1 + 2 + SdDataLength);
+                      PutByte(AdType);
+                      PutWord(SdUuid16);
+                      for I:=0 to SdDataLength - 1 do
+                       PutByte(SdData[I]);
+                     end;
+    ADT_MANUFACTURER_SPECIFIC:
+                              begin
+                               PutByte(1 + 2 + MfrDataLength);
+                               PutByte(AdType);
+                               PutWord(Mfr);
+                               for I:=0 to MfrDataLength - 1 do
+                                PutByte(MfrData[I]);
+                              end;
+   end;
+end;
+
+function ParseAdPacket(Index:Integer;Data:Array of Byte):TBleAdPacket;
+begin
+ Result.AdsLength:=0;
+ while Index <= High(Data) do
+  begin
+   if Result.AdsLength > High(Result.Ads) then
+    Fail('ParseAdPacket overflow');
+   Result.Ads[Result.AdsLength]:=ParseAd(Index,Data);
+   Inc(Index,Result.Ads[Result.AdsLength].BytesLength + 2);
+   Inc(Result.AdsLength);
+  end;
+end;
+
+function TBleAd.ToDisplayString:String;
+var 
+ I:Integer;
+ BytesString:String;
+begin
+ case AdType of 
+  ADT_FLAGS:
+            begin
+             Result:=Format('fl,%02.2x',[Flags]);
+            end;
+  ADT_COMPLETE_UUID16:
+                      begin
+                       Result:=Format('ui,%04.4x',[Uuid16]);
+                      end;
+  ADT_INCOMPLETE_UUID128:
+                         begin
+                          Result:='ui,128';
+                         end;
+  ADT_COMPLETE_LOCAL_NAME:
+                          begin
+                           BytesString:='';
+                           for I:=0 to NameLength - 1 do
+                            BytesString:=BytesString + Char(Name[I]);
+                           Result:=Format('nm,%s',[BytesString]);
+                          end;
+  ADT_POWER_LEVEL:
+                  begin
+                   Result:=Format('pw,%s',[dBm(PowerLevel)]);
+                  end;
+  ADT_SERVICE_DATA:
+                   begin
+                    BytesString:='';
+                    for I:=0 to SdDataLength - 1 do
+                     BytesString:=BytesString + SdData[I].ToHexString(2);
+                    Result:=Format('sd,%04.4x,%s',[SdUuid16,BytesString]);
+                   end;
+  ADT_DEVICE_APPEARANCE:
+                        begin
+                         if Appearance = $03c1 then
+                          Result:='ap,keyboard'
+                         else
+                          Result:=Format('ap,%04.4x',[Appearance]);
+                        end;
+  ADT_MANUFACTURER_SPECIFIC:
+                            begin
+                             //                           BytesString:='';
+                             BytesString:=IntToStr(MfrDataLength) + ':';
+                             for I:=0 to MfrDataLength - 1 do
+                              BytesString:=BytesString + MfrData[I].ToHexString(2);
+                             Result:=Format('%s,%s',[ManufacturerToString(Mfr),BytesString]);
+                            end;
+  else
+   begin
+    BytesString:='';
+    for I:=0 to BytesLength - 1 do
+     BytesString:=BytesString + Bytes[I].ToHexString(2);
+    Result:=Format('%02.2x,%s',[AdType,BytesString]);
+   end;
+ end;
+end;
+
+
+function TBleAdPacket.IsFlags(Index:Integer;Flags:Byte):Boolean;
+begin
+ Result:=False;
+ if Index < AdsLength then
+  if Ads[Index].AdType = ADT_FLAGS then
+   Result:=Ads[Index].Flags = Flags;
+end;
+
+function TBleAdPacket.IsMfr(Index:Integer;Mfr:Word;Prefix:Array of Byte;RemainingSize:Integer):Boolean;
+var 
+ I:Integer;
+begin
+ Result:=False;
+ if Index < AdsLength then
+  if Ads[Index].AdType = ADT_MANUFACTURER_SPECIFIC then
+   if Ads[Index].Mfr = Mfr then
+    if Length(Prefix) + RemainingSize = Ads[Index].MfrDataLength then
+     begin
+      for I:=0 to High(Prefix) do
+       if Ads[Index].MfrData[I] <> Prefix[I] then
+        exit;
+      Result:=True;
+     end;
+end;
+
+function TBleAdPacket.ToDisplayString:String;
+var 
+ I:Integer;
+begin
+ if IsFlags(0,$1a) and IsMfr(1,ManufacturerApple,[$09,$06,$03],5) then
+  begin
+   Result:='AppleTv ';
+   for I:=0 to 4 do
+    begin
+     Result:=Result + Ads[1].MfrData[3 + I].ToHexString(2);
+     if I = 0 then
+      Result:=Result + ' ';
+    end;
+  end
+ else if IsMfr(0,ManufacturerMicrosoft,[$01,$09,$20],4 + 20) then
+       begin
+        Result:='win10 salt ';
+        for I:=0 to 4 - 1 do
+         Result:=Result + Ads[0].MfrData[3 + I].ToHexString(2);
+        Result:=Result + ' hash ';
+        for I:=0 to 20 - 1 do
+         Result:=Result + Ads[0].MfrData[3 + 4 + I].ToHexString(2);
+       end
+ else
+  begin
+   Result:='';
+   for I:=0 to AdsLength - 1 do
+    Result:=Result + Ads[I].ToDisplayString + ' ';
+  end;
+end;
+
 procedure ParseEvent;
 var 
+ ParsedPacket:TBleAdPacket;
  I:Integer;
  EventType,EventSubtype,EventLength:Byte;
  EddystoneLength,AdType,EddystoneLo,EddystoneHi,EddystoneType,TransmitPower,Rssi,C,AdEventType,AddressType:Byte;
@@ -1091,22 +1394,21 @@ var
  TlmTemperature:Word;
  TlmAdvCount:LongWord;
  TlmSecCount:LongWord;
- Event:Array of Byte;
- S:String;
+ Event:array of Byte;
+ S:string;
  GetByteIndex:Integer;
- AddressString:String;
+ AddressString:string;
  MainType,MfrLo,MfrHi,MainValue:Byte;
  MfrType,MfrLength,MfrFirst,MfrSecond:Byte;
  Uuid:TUuid;
  MajorLo,MajorHi,MinorLo,MinorHi:Byte;
- NameSpace:Array[0 .. 9] of Byte;
- Instance:Array[0 .. 5] of Byte;
- EphemeralId:Array[0 .. 7] of Byte;
+ NameSpace:array[0 .. 9] of Byte;
+ Instance:array[0 .. 5] of Byte;
+ EphemeralId:array[0 .. 7] of Byte;
  AltBeaconUuid:TUuid;
- AltBeaconFourBytes:Array [0 .. 3] of Byte;
+ AltBeaconFourBytes:array [0 .. 3] of Byte;
  AltBeaconReserved:Byte;
- AppleTvVarying:Byte;
- AddressBytes:Array[0 .. 5] of Byte;
+ AddressBytes:array[0 .. 5] of Byte;
  LeEventType:Byte;
 function GetByte:Byte;
 begin
@@ -1171,6 +1473,8 @@ begin
   end;
  AddressString:=AddressString + MacAddressTypeToStr(AddressType) + AdEventTypeToStr(AdEventType);
  DataLength:=GetByte;
+ ParsedPacket:=ParseAdPacket(GetByteIndex,Event);
+ Track(ClockGetCount,Rssi,Format('%s ads',[AddressString]),ParsedPacket.ToDisplayString);
  FlagsLength:=GetByte;
  FlagsType:=GetByte;
  Flags:=GetByte;
@@ -1198,7 +1502,7 @@ begin
    MfrLength:=GetByte;
    MfrFirst:=GetByte;
    MfrSecond:=GetByte;
-   if (AsWord(MfrHi,MfrLo) = Word(ManufacturerTesting)) and (MfrType = $55) and (MfrLength = $4c) then
+   if (AsWord(MfrHi,MfrLo) = Word(ManufacturerTesting)) and (MfrType = $55) and (MfrLength = $96) then
     begin
      S:=Char(MfrSecond);
      while GetByteIndex <= High(Event) do
@@ -1207,29 +1511,29 @@ begin
       end;
      Track(ClockGetCount,Rssi,Format('%s ult chan %d',[AddressString,MfrFirst]),S);
     end
-   else if (((MfrHi shl 8) or MfrLo) = ManufacturerMicrosoft) and (MfrType = $01) and (MfrLength = $09) and (MfrFirst = $20) then
-         begin
-          S:='salt ';
-          GetByteIndex:=19;
-          while GetByteIndex <= 22 do
-           S:=S + GetByte.ToHexString(2);
-          S:=S + ' hash ';
-          while GetByteIndex <= High(Event) do
-           S:=S + GetByte.ToHexString(2);
-          Track(ClockGetCount,Rssi,Format('%s mfr win10',[AddressString]),S);
-         end
-   else
-    begin
-     S:='';
-     GetByteIndex:=15;
-     while GetByteIndex <= High(Event) do
-      begin
-       S:=S + GetByte.ToHexString(2);
-       if (GetByteIndex mod 4) = 3 then
-        S:=S + ' ';
-      end;
-     Track(ClockGetCount,Rssi,Format('%s mfr %s %s',[AddressString,ManufacturerToString(AsWord(MfrHi,MfrLo)),S]),'');
-    end;
+    // else if (((MfrHi shl 8) or MfrLo) = ManufacturerMicrosoft) and (MfrType = $01) and (MfrLength = $09) and (MfrFirst = $20) then
+    //       begin
+    //        S:=IntToStr(Length(Event) - 19 ) + ' salt ';
+    //        GetByteIndex:=19;
+    //        while GetByteIndex <= 22 do
+    //         S:=S + GetByte.ToHexString(2);
+    //        S:=S + ' hash ';
+    //        while GetByteIndex <= High(Event) do
+    //         S:=S + GetByte.ToHexString(2);
+    //        Track(ClockGetCount,Rssi,Format('%s mfr win10',[AddressString]),S);
+    //       end;
+    // else
+    //  begin
+    //   S:='';
+    //   GetByteIndex:=15;
+    //   while GetByteIndex <= High(Event) do
+    //    begin
+    //     S:=S + GetByte.ToHexString(2);
+    //     if (GetByteIndex mod 4) = 3 then
+    //      S:=S + ' ';
+    //    end;
+    //   Track(ClockGetCount,Rssi,Format('%s mfr %s %s',[AddressString,ManufacturerToString(AsWord(MfrHi,MfrLo)),S]),'');
+    //  end;
   end
  else if (FlagsLength = $04) and (FlagsType = $09) then
        begin
@@ -1253,29 +1557,18 @@ begin
           TransmitPower:=GetByte;
           Track(ClockGetCount,Rssi,Format('%s ibn %6stx %s mjr %d mnr %d',[AddressString,dBm(TransmitPower),UuidToStr(Uuid),AsWord(MajorHi,MajorLo),AsWord(MinorHi,MinorLo)]),'');
          end
-        else if (MfrType = $09) and (MfrLength = $06) and (MfrFirst = $03) then
-              begin
-               GetByteIndex:=21;
-               AppleTvVarying:=GetByte;
-               S:='';
-               for I:=0 to 3 do
-                begin
-                 S:=S + GetByte.ToHexString(2);
-                end;
-               Track(ClockGetCount,Rssi,Format('%s mfr AppleTV %s',[AddressString,S]),AppleTvVarying.ToHexString(2));
-              end
-        else
-         begin
-          S:='';
-          GetByteIndex:=18;
-          while GetByteIndex <= High(Event) do
-           begin
-            S:=S + GetByte.ToHexString(2);
-            if (GetByteIndex mod 4) = 2 then
-             S:=S + ' ';
-           end;
-          Track(ClockGetCount,Rssi,Format('%s mfr %s %s',[AddressString,ManufacturerToString(AsWord(MfrHi,MfrLo)),LeftStr(S,4)]),RightStr(S,Length(S) - 4));
-         end
+         //      else
+         //       begin
+         //        S:='';
+         //        GetByteIndex:=18;
+         //        while GetByteIndex <= High(Event) do
+         //         begin
+         //          S:=S + GetByte.ToHexString(2);
+         //          if (GetByteIndex mod 4) = 2 then
+         //           S:=S + ' ';
+         //         end;
+         //        Track(ClockGetCount,Rssi,Format('%s mfr %s %s',[AddressString,ManufacturerToString(AsWord(MfrHi,MfrLo)),LeftStr(S,4)]),RightStr(S,Length(S) - 4));
+         //       end
        end
  else if (MainType = $ff) and (((MfrHi shl 8) or MfrLo) = ManufacturerTesting) and (MfrType = $BE) and (MfrLength = $AC) then
        begin
@@ -1345,7 +1638,7 @@ begin
                TlmTemperature:=GetWord;
                TlmAdvCount:=GetLongWord;
                TlmSecCount:=GetLongWord;
-               Track(ClockGetCount,Rssi,Format('%s tlm',[AddressString]),Format('battery %5.3fV temp %3d.%02.2dC adv %d up %s',[TlmBattery*0.001,(TlmTemperature shr 8),TlmTemperature and $ff,TlmAdvCount,TimeToString(SecondsToTime(TlmSecCount div 10))]));
+               Track(ClockGetCount,Rssi,Format('%s tlm',[AddressString]),Format('battery %5.3fV temp %2d.%02.2dC adv %d up %s',[TlmBattery*0.001,(TlmTemperature shr 8),TlmTemperature and $ff,TlmAdvCount,TimeToString(SecondsToTime(TlmSecCount div 10))]));
               end
         else if EddystoneType = $30 then
               begin
@@ -1360,14 +1653,14 @@ begin
               end
         else
          begin
-          Track(ClockGetCount,Rssi,Format('%s hex1 %s',[AddressString,S]),'');
+          Track(ClockGetCount,Rssi,Format('%s hex %s',[AddressString,S]),'');
           Log(Format('%s hex %s',[AddressString,S]));
          end;
        end
  else
   begin
    // Log(Format('message %02.2x %02.2x %d bytes %s',[EventType,EventSubtype,EventLength,S]));
-   Track(ClockGetCount,Rssi,Format('%s hex %s',[AddressString,S]),'');
+   // Track(ClockGetCount,Rssi,Format('%s hex %s',[AddressString,S]),'');
   end;
 end;
 
@@ -1415,6 +1708,8 @@ FlushRx;
 end;
 
 function LedLoop(Parameter:Pointer):PtrInt;
+var 
+ I,N:Integer;
 begin
  Result:=0;
  ActivityLedEnable;
@@ -1423,16 +1718,28 @@ begin
    ActivityLedOn;
    Sleep(100);
    ActivityLedOff;
-   Sleep(900);
+   N:=Min(ScanRxCount,3);
+   for I:=1 to N do
+    begin
+     Sleep(100);
+     ActivityLedOn;
+     Sleep(100);
+     ActivityLedOff;
+    end;
+   Sleep(900 - 200*N);
   end;
 end;
 
 begin
  Console1 := ConsoleWindowCreate(ConsoleDeviceGetDefault,CONSOLE_POSITION_TOPRIGHT,True);
- Console2 := ConsoleWindowCreate(ConsoleDeviceGetDefault,CONSOLE_POSITION_LEFT,False);
+ Console2 := ConsoleWindowCreate(ConsoleDeviceGetDefault,CONSOLE_POSITION_TOPLEFT,False);
+ Console3 := ConsoleWindowCreate(ConsoleDeviceGetDefault,CONSOLE_POSITION_BOTTOMLEFT,False);
  ConsoleWindowSetBackcolor(Console2,COLOR_BLACK);
  ConsoleWindowSetForecolor(Console2,COLOR_YELLOW);
+ ConsoleWindowSetBackcolor(Console3,COLOR_CYAN);
+ ConsoleWindowSetForecolor(Console3,COLOR_WHITE);
  ConsoleWindowClear(Console2);
+ ConsoleWindowClear(Console3);
  Log('bluetooth-dev');
  RestoreBootFile('default','config.txt');
  StartLogging;
@@ -1445,50 +1752,61 @@ begin
  Help;
  WaitForSDDrive;
 
-{$ifdef USE_WEB_STATUS}
  HTTPListener:=THTTPListener.Create;
  HTTPListener.Active:=True;
  WEBSTATUS_FONT_NAME:='Monospace';
- WebStatusRegister(HTTPListener,'','',True);
+ WebStatusRegister(HTTPListener,'','',False);
  BluetoothWebStatus:=TBluetoothWebStatus.Create('Bluetooth','/bluetooth',1);
  HTTPListener.RegisterDocument('',BluetoothWebStatus);
-{$endif}
+ HTTPRedirect:=THTTPRedirect.Create;
+ HTTPRedirect.Name:='/';
+ HTTPRedirect.Location:='/status/bluetooth';
+ HTTPListener.RegisterDocument('',HTTPRedirect);
 
  if IsBlueToothAvailable then
   begin
    ReadByteCounter:=0;
    OpenUart0;
    ResetChip;
-   BCMLoadFirmware(BluetoothMiniDriverFileName);
-   SetLEEventMask($ff);
-   Log('Init complete');
-   BeginThread(@LedLoop,Nil,LedLoopHandle,THREAD_STACK_DEFAULT_SIZE);
-   ExceptionRestartCounter:=0;
-   ScanCycleCounter:=0;
-   ReadByteCounter:=0;
-   while True do
-    begin
-     try
-      RestartBroadcastObserveLoop:=False;
-      ReadBackLog:=0;
-      DropByte:=False;
-      StartLeAdvertising;
-      Margin:=High(Margin);
-      SetLength(MessageTrackList,0);
-      StartActiveScanning;
-      Log('Receiving scan data');
-      ScanIdle:=True;
-      while not RestartBroadcastObserveLoop do
-       ParseEvent;
-     except
-      on E:Exception do
-           begin
-            Inc(ExceptionRestartCounter);
-            LoggingOutput(Format('ExceptionRestartCounter %d',[ExceptionRestartCounter]));
-            Flush(E.Message);
-           end;
-    end;
+   try
+    BCMLoadFirmware;
+   except
+    on E:Exception do
+         begin
+          LoggingOutput(Format('load exception %s',[E.Message]));
+         end;
   end;
+ SetLEEventMask($ff);
+ Log('Init complete');
+ BeginThread(@LedLoop,Nil,LedLoopHandle,THREAD_STACK_DEFAULT_SIZE);
+ ExceptionRestartCounter:=0;
+ ScanCycleCounter:=0;
+ ReadByteCounter:=0;
+ while True do
+  begin
+   try
+    RestartBroadcastObserveLoop:=False;
+    ReadBackLog:=0;
+    DropByte:=False;
+    StartLeAdvertising;
+    Margin:=High(Margin);
+    SetLength(MessageTrackList,0);
+    SetLength(ConnectionList,0);
+    StartActiveScanning;
+    Log('Receiving scan data');
+    ScanIdle:=True;
+    ScanRxCount:=0;
+    while not RestartBroadcastObserveLoop do
+     ParseEvent;
+   except
+    on E:Exception do
+         begin
+          Inc(ExceptionRestartCounter);
+          LoggingOutput(Format('ExceptionRestartCounter %d',[ExceptionRestartCounter]));
+          Flush(E.Message);
+         end;
+  end;
+end;
 end;
 ThreadHalt(0);
 end.

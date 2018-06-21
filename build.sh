@@ -36,8 +36,7 @@ ULTIBO=$HOME/ultibo/core
 ULTIBOBIN=$ULTIBO/fpc/bin
 REPO=bluetooth-dev
 export PATH=$ULTIBOBIN:$PATH
-for f in *.lpr
-
+for f in *.lpr *.pas
 do
     ptop -l 1000 -i 1 -c ptop.cfg $f $f.formatted
     mv $f.formatted $f
